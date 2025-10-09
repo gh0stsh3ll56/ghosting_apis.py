@@ -380,8 +380,7 @@ Unauthorized access to computer systems is illegal. Ghost Ops Security and the t
 ## Support
 
 For Ghost Ops Security clients:
-- Technical support: support@ghostopssecurity.com
-- Emergency response: +1-XXX-XXX-XXXX
+- Technical support: info@ghostops-security.com
 
 ## Version History
 
@@ -396,6 +395,7 @@ For Ghost Ops Security clients:
 
 Developed by Ghost Ops Security
 Penetration Testing & Security Research
+Author:Gh0stsh3ll56
 
 ---
 
